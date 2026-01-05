@@ -37,6 +37,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import zlib
 import pickle
+from urllib.parse import urlparse, urljoin, parse_qs, quote, unquote, urlunparse
+
+import warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+
 
 # ============================================================================
 # THIRD-PARTY IMPORTS WITH FALLBACKS
@@ -135,7 +142,7 @@ class ScannerConfig:
     use_headless: bool = True
     use_proxy: str = None
     follow_redirects: bool = True
-    verify_ssl: bool = False
+    verify_ssl: bool = True #False edited
 
     # Detection settings
     detect_waf: bool = True
@@ -387,10 +394,20 @@ class AdvancedHTTPClient:
         if not self.session:
             self.init_session()
 
+        parsed_url = urlparse(url)
+        is_localhost = parsed_url.hostname in ['localhost', '127.0.0.1', '0.0.0.0']
+
+        # Auto-detect: verify SSL for public domains, don't verify for localhost
+        if 'verify' not in kwargs:
+            if is_localhost:
+                kwargs['verify'] = False
+            else:
+                kwargs['verify'] = self.config.verify_ssl
+
         # Add default kwargs
         kwargs.setdefault('timeout', self.config.timeout)
         kwargs.setdefault('allow_redirects', self.config.follow_redirects)
-        kwargs.setdefault('verify', self.config.verify_ssl)
+        #kwargs.setdefault('verify', self.config.verify_ssl)
 
         # Add delay if configured
         if self.config.request_delay > 0:
@@ -447,6 +464,11 @@ class WebCrawler:
             return []
 
         logging.info(f"Crawler: Restricting to domain: {self.base_domain}, Max depth: {self.config.max_depth}")
+
+        if self.config.max_depth == 0:
+            logging.info("Depth 0 specified - only scanning provided URL")
+            page_info = self.crawl_page(start_url)
+            return [page_info] if page_info else []
 
         # Use deque with depth tracking: (url, depth)
         self.to_visit = deque([(start_url, 0)])
@@ -723,8 +745,6 @@ class WebCrawler:
         # Remove duplicates
         unique_links = list(set(links))
 
-        print("Links : "+unique_links.__str__())
-
         # Debug logging
         if unique_links:
             logging.debug(f"Extracted {len(unique_links)} links from {base_url}")
@@ -954,14 +974,45 @@ class ReflectedXSSDetector:
 
         for payload in payloads[:self.config.payload_count]:
             try:
-                # Prepare test URL with payload
+                # Parse URL
                 parsed = urlparse(url)
+
+                # Check if payload contains javascript: protocol - skip these for GET requests
+                if payload.lower().startswith(('javascript:', 'data:')):
+                    # These payloads are for DOM XSS, not reflected GET parameters
+                    continue
+
+
+                # Prepare test URL with payload
                 params = parse_qs(parsed.query)
-                params[param_name] = [payload]
+
+                # Clean the payload for URL inclusion
+                clean_payload = payload
+                # Remove problematic characters that break URL parsing
+                if clean_payload.startswith('javascript:'):
+                    # Encode the entire javascript: payload
+                    clean_payload = quote(clean_payload, safe='')
+                elif any(c in clean_payload for c in ['\n', '\r', '\t']):
+                    # Encode control characters
+                    clean_payload = quote(clean_payload)
+
+                params[param_name] = [clean_payload]
 
                 # Reconstruct URL
-                new_query = '&'.join([f"{k}={quote(v[0])}" for k, v in params.items()])
-                test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                new_query = '&'.join([f"{k}={quote(v[0], safe='')}" for k, v in params.items()])
+
+                # Rebuild URL properly
+                test_url = urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    new_query,
+                    parsed.fragment
+                ))
+                if not self.is_valid_test_url(test_url):
+                    logging.debug(f"Skipping invalid test URL: {test_url[:100]}...")
+                    continue
 
                 # Make request
                 response = http_client.get(test_url)
@@ -1433,6 +1484,31 @@ class ReflectedXSSDetector:
         analysis['context'] = self.get_reflection_context(payload, response_text)
 
         return analysis
+
+    def is_valid_test_url(self, url: str) -> bool:
+        """Check if URL is valid for testing"""
+        try:
+            parsed = urlparse(url)
+
+            # Skip javascript: and data: URLs for HTTP requests
+            if parsed.scheme in ['javascript', 'data', 'file', 'mailto', 'tel']:
+                return False
+
+            # Check for malformed URLs
+            if not parsed.netloc and not url.startswith(('http://', 'https://')):
+                return False
+
+            # Check for obvious payloads in the hostname (like collaborator URLs)
+            if 'collaborator' in parsed.netloc.lower() or 'interactsh' in parsed.netloc.lower():
+                return False
+
+            # Validate the URL structure
+            if parsed.scheme not in ['http', 'https', '']:
+                return False
+
+            return True
+        except Exception:
+            return False
 
 
 class DOMXSSDetector:
@@ -2647,8 +2723,15 @@ class AdvancedXSSScanner:
                     except Exception as e:
                         logging.error(f"Error scanning {url}: {e}")
 
-            self.results.vulnerabilities = vulnerabilities
-            self.results.vulnerabilities_found = len(vulnerabilities)
+            #self.results.vulnerabilities = self.deduplicate_vulnerabilities(vulnerabilities)
+            #self.results.vulnerabilities = self.smart_deduplicate(vulnerabilities)
+
+            self.results.vulnerabilities = self.deduplicate_vulnerabilities_advanced(vulnerabilities)
+            self.results.vulnerabilities_found = len(self.results.vulnerabilities)
+
+            #old
+            #self.results.vulnerabilities = vulnerabilities
+            #self.results.vulnerabilities_found = len(vulnerabilities)
 
             # Phase 3: Technology fingerprinting
             logging.info("Phase 3: Fingerprinting technologies...")
@@ -2680,6 +2763,170 @@ class AdvancedXSSScanner:
             raise
 
         return self.results
+
+    def deduplicate_vulnerabilities(self, vulnerabilities: List[Vulnerability]) -> List[Vulnerability]:
+        """Remove duplicate vulnerabilities"""
+        unique_vulns = {}
+
+        for vuln in vulnerabilities:
+            # Create a unique key: url + parameter + payload hash
+            key = f"{vuln.url}:{vuln.parameter}:{hashlib.md5(vuln.payload.encode()).hexdigest()[:8]}"
+
+            if key not in unique_vulns:
+                unique_vulns[key] = vuln
+            else:
+                # Keep the one with higher confidence
+                if vuln.confidence > unique_vulns[key].confidence:
+                    unique_vulns[key] = vuln
+
+        return list(unique_vulns.values())
+
+    def deduplicate_vulnerabilities_advanced(self, vulnerabilities: List[Vulnerability]) -> List[Vulnerability]:
+        """Advanced deduplication considering context and severity"""
+        # Group by URL + parameter
+        grouped = {}
+
+        for vuln in vulnerabilities:
+            # Create grouping key
+            key = f"{vuln.url}:{vuln.parameter}"
+
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(vuln)
+
+        unique_vulns = []
+
+        for key, vuln_list in grouped.items():
+            # Sort by confidence (highest first)
+            vuln_list.sort(key=lambda x: x.confidence, reverse=True)
+
+            # Take the highest confidence one
+            best_vuln = vuln_list[0]
+
+            # Add context about variations found
+            if len(vuln_list) > 1:
+                payload_variations = list(set([v.payload[:50] for v in vuln_list]))
+                best_vuln.context['variations_found'] = len(vuln_list)
+                best_vuln.context['payload_samples'] = payload_variations[:3]  # First 3
+
+            unique_vulns.append(best_vuln)
+
+        return unique_vulns
+
+    def smart_deduplicate(self, vulnerabilities: List[Vulnerability]) -> List[Vulnerability]:
+        """Smart deduplication with multiple strategies"""
+        if not vulnerabilities:
+            return []
+
+        # Strategy 1: Remove exact duplicates
+        exact_unique = self._remove_exact_duplicates(vulnerabilities)
+
+        # Strategy 2: Remove similar payloads on same parameter
+        context_unique = self._remove_context_duplicates(exact_unique)
+
+        # Strategy 3: Keep only highest severity per attack vector
+        final_vulns = self._keep_best_per_vector(context_unique)
+
+        return final_vulns
+
+    def _remove_exact_duplicates(self, vulns: List[Vulnerability]) -> List[Vulnerability]:
+        """Remove exact duplicates (same URL + exact same payload)"""
+        seen = set()
+        unique = []
+
+        for vuln in vulns:
+            key = f"{vuln.url}:{vuln.parameter}:{vuln.payload}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(vuln)
+
+        return unique
+
+    def _remove_context_duplicates(self, vulns: List[Vulnerability]) -> List[Vulnerability]:
+        """Remove duplicates in same context"""
+        grouped = defaultdict(list)
+
+        for vuln in vulns:
+            # Group by URL + parameter + payload type
+            payload_type = self._classify_payload_type(vuln.payload)
+            group_key = f"{vuln.url}:{vuln.parameter}:{payload_type}"
+            grouped[group_key].append(vuln)
+
+        result = []
+        for group_key, vuln_list in grouped.items():
+            # Sort by confidence and severity
+            vuln_list.sort(key=lambda x: (
+                -x.confidence,  # Higher confidence first
+                -self._severity_value(x.severity)  # Higher severity first
+            ))
+            result.append(vuln_list[0])
+
+        return result
+
+    def _classify_payload_type(self, payload: str) -> str:
+        """Classify payload by type"""
+        payload_lower = payload.lower()
+
+        if '<script>' in payload_lower:
+            return 'script_tag'
+        elif 'onerror=' in payload_lower or 'onload=' in payload_lower:
+            return 'event_handler'
+        elif 'javascript:' in payload_lower:
+            return 'javascript_url'
+        elif 'data:' in payload_lower:
+            return 'data_url'
+        elif '<svg' in payload_lower:
+            return 'svg_tag'
+        elif '<img' in payload_lower:
+            return 'img_tag'
+        elif '<iframe' in payload_lower:
+            return 'iframe_tag'
+        elif 'innerhtml' in payload_lower or 'document.write' in payload_lower:
+            return 'dom_manipulation'
+        elif 'eval(' in payload_lower or 'function(' in payload_lower:
+            return 'js_execution'
+        else:
+            return 'other'
+
+    def _severity_value(self, severity: str) -> int:
+        """Convert severity to numeric value"""
+        severity_map = {
+            'critical': 4,
+            'high': 3,
+            'medium': 2,
+            'low': 1,
+            'info': 0
+        }
+        return severity_map.get(severity.lower(), 0)
+
+    def _keep_best_per_vector(self, vulns: List[Vulnerability]) -> List[Vulnerability]:
+        """Keep best finding per attack vector"""
+        # Group by attack vector
+        vectors = defaultdict(list)
+
+        for vuln in vulns:
+            vector = self._determine_attack_vector(vuln)
+            vectors[vector].append(vuln)
+
+        result = []
+        for vector, vuln_list in vectors.items():
+            # Get the most severe
+            vuln_list.sort(key=lambda x: (
+                -self._severity_value(x.severity),
+                -x.confidence
+            ))
+            result.append(vuln_list[0])
+
+        return result
+
+    def _determine_attack_vector(self, vuln: Vulnerability) -> str:
+        """Determine the attack vector"""
+        if vuln.type == 'dom':
+            return f"dom_{vuln.parameter}"
+        elif vuln.type == 'stored':
+            return f"stored_{vuln.parameter}"
+        else:  # reflected
+            return f"reflected_{vuln.parameter}"
 
     def calculate_statistics(self):
         """Calculate scan statistics"""
@@ -2958,6 +3205,10 @@ Examples:
     config.use_proxy = args.proxy
     config.verbose = args.verbose
     config.debug = args.debug
+
+    if args.depth == 0:
+        # When depth is 0, only scan the provided URL
+        config.max_pages = 1  # Only scan the initial page
 
     # Adjust for quick/full mode
     if args.quick:
