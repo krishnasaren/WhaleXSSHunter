@@ -427,7 +427,7 @@ class AdvancedHTTPClient:
 # ============================================================================
 
 class WebCrawler:
-    """Advanced web crawler for URL discovery"""
+    """Advanced web crawler for URL discovery - ONLY crawls same domain and subdomains"""
 
     def __init__(self, http_client: AdvancedHTTPClient, config: ScannerConfig):
         self.client = http_client
@@ -436,55 +436,303 @@ class WebCrawler:
         self.to_visit = deque()
         self.discovered_pages = []
         self.lock = threading.Lock()
+        self.base_domain = None
 
     def crawl(self, start_url: str) -> List[PageInfo]:
-        """Crawl website starting from given URL"""
-        self.to_visit.append(start_url)
+        """Crawl website starting from given URL with depth limitation"""
+        # Store base domain for filtering
+        self.base_domain = self._extract_base_domain(start_url)
+        if not self.base_domain:
+            logging.error(f"Invalid start URL: {start_url}")
+            return []
 
-        with ThreadPoolExecutor(max_workers=self.config.max_concurrent) as executor:
-            futures = []
+        logging.info(f"Crawler: Restricting to domain: {self.base_domain}, Max depth: {self.config.max_depth}")
 
-            while self.to_visit and len(self.visited) < self.config.max_pages:
-                current_url = self.to_visit.popleft()
+        # Use deque with depth tracking: (url, depth)
+        self.to_visit = deque([(start_url, 0)])
+        self.visited = set()
+        self.discovered_pages = []
 
-                if current_url in self.visited:
-                    continue
+        while self.to_visit and len(self.visited) < self.config.max_pages:
+            batch_size = min(len(self.to_visit), self.config.max_concurrent)
+            current_batch = []
 
-                self.visited.add(current_url)
+            # Get batch of URLs to process with their depths
+            for _ in range(batch_size):
+                if self.to_visit:
+                    current_batch.append(self.to_visit.popleft())
 
-                # Submit crawl task
-                future = executor.submit(self.crawl_page, current_url)
-                futures.append(future)
+            # Process batch concurrently
+            with ThreadPoolExecutor(max_workers=self.config.max_concurrent) as executor:
+                futures = []
 
-            # Wait for all futures
-            for future in as_completed(futures):
-                try:
-                    page_info = future.result()
-                    if page_info:
-                        self.discovered_pages.append(page_info)
-                except Exception as e:
-                    logging.error(f"Crawl error: {e}")
+                for url, depth in current_batch:
+                    if url in self.visited:
+                        continue
 
+                    # Filter URLs BEFORE processing
+                    if not self._is_same_domain(url):
+                        logging.debug(f"Skipping external URL: {url}")
+                        continue
+
+                    self.visited.add(url)
+                    future = executor.submit(self.crawl_page_with_depth, url, depth)
+                    futures.append((future, url, depth))
+
+                # Wait for all futures and collect results
+                for future, url, depth in futures:
+                    try:
+                        page_info = future.result(timeout=self.config.timeout)
+                        if page_info:
+                            self.discovered_pages.append(page_info)
+
+                            # Add new links to the queue for NEXT iteration if depth allows
+                            if (len(self.visited) < self.config.max_pages and
+                                    depth < self.config.max_depth - 1):  # depth is 0-based
+
+                                for link in page_info.links:
+                                    if (link not in self.visited and
+                                            not any(link == item[0] for item in self.to_visit) and
+                                            self._should_crawl_link(link)):
+                                        self.to_visit.append((link, depth + 1))
+
+                    except Exception as e:
+                        logging.error(f"Crawl error for {url}: {e}")
+
+        logging.info(f"Crawler finished: Found {len(self.discovered_pages)} pages within depth {self.config.max_depth}")
         return self.discovered_pages
+
+    def crawl_page_with_depth(self, url: str, depth: int) -> Optional[PageInfo]:
+        """Crawl a single page with depth info"""
+        try:
+            # Double-check domain before crawling
+            if not self._is_same_domain(url):
+                logging.debug(f"Skipping external domain at depth {depth}: {url}")
+                return None
+
+            logging.debug(f"Crawling depth {depth}: {url}")
+            response = self.client.get(url)
+            page_info = self.analyze_page(url, response)
+
+            # Filter links immediately after extraction
+            filtered_links = []
+            for link in page_info.links:
+                if self._should_crawl_link(link):
+                    filtered_links.append(link)
+                else:
+                    logging.debug(f"Filtered out link: {link}")
+
+            # Replace with filtered links
+            page_info.links = filtered_links
+
+            return page_info
+
+        except Exception as e:
+            logging.error(f"Failed to crawl {url}: {e}")
+            return None
+
+    def _extract_base_domain(self, url: str) -> str:
+        """Extract base domain from URL (e.g., example.com from sub.example.com)"""
+        try:
+            parsed = urlparse(url)
+            if not parsed.netloc:
+                return None
+
+            # Remove port if present
+            domain = parsed.netloc.split(':')[0]
+
+            # For IP addresses, return as-is
+            if re.match(r'\d+\.\d+\.\d+\.\d+', domain):
+                return domain
+
+            # For localhost, return as-is
+            if domain == 'localhost':
+                return domain
+
+            # Extract base domain (last two parts for regular domains)
+            parts = domain.split('.')
+            if len(parts) >= 2:
+                # Handle exceptions like .co.uk, .com.au
+                if len(parts) > 2 and parts[-2] in ['co', 'com', 'org', 'net', 'gov', 'edu']:
+                    return '.'.join(parts[-3:])
+                return '.'.join(parts[-2:])
+            return domain
+
+        except Exception:
+            return None
+
+    def _is_same_domain(self, url: str) -> bool:
+        """Check if URL belongs to same domain or subdomain"""
+        if not self.base_domain:
+            return True  # If no base domain set, allow all (shouldn't happen)
+
+        try:
+            parsed = urlparse(url)
+            if not parsed.netloc:
+                return False
+
+            domain = parsed.netloc.split(':')[0]
+
+            # Check for exact match or subdomain
+            if domain == self.base_domain:
+                return True
+
+            # Check for subdomain (e.g., sub.example.com matches example.com)
+            if domain.endswith('.' + self.base_domain):
+                return True
+
+            # Special case: localhost and 127.0.0.1
+            if self.base_domain in ['localhost', '127.0.0.1']:
+                return domain in ['localhost', '127.0.0.1', '0.0.0.0']
+
+            return False
+
+        except Exception:
+            return False
+
+    def _should_crawl_link(self, link: str) -> bool:
+        """Determine if a link should be crawled"""
+        # First check if it's the same domain
+        if not self._is_same_domain(link):
+            return False
+
+        try:
+            # Skip common static files
+            static_extensions = [
+                '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg',
+                '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.avi', '.mov',
+                '.pdf', '.zip', '.tar', '.gz', '.rar', '.exe', '.dmg', '.pkg',
+                '.json', '.xml', '.csv', '.txt', '.log'
+            ]
+
+            # Parse the URL to get the path
+            parsed = urlparse(link)
+            path = parsed.path.lower()
+
+            # Check file extensions
+            if any(path.endswith(ext) for ext in static_extensions):
+                return False
+
+            # Skip non-HTTP/HTTPS protocols
+            if parsed.scheme not in ['http', 'https', '']:
+                return False
+
+            # Skip common non-page URLs
+            skip_patterns = [
+                'javascript:', 'mailto:', 'tel:', 'sms:', 'data:',
+                'ftp:', 'ssh:', 'file:', 'blob:', 'about:'
+            ]
+            if any(link.lower().startswith(pattern) for pattern in skip_patterns):
+                return False
+
+            # Skip URLs with fragments only
+            if link.startswith('#'):
+                return False
+
+            # Skip URLs that are obviously payloads (like collaborator)
+            payload_indicators = ['collaborator', 'burpcollaborator', 'interactsh']
+            if any(indicator in link.lower() for indicator in payload_indicators):
+                return False
+
+            return True
+
+        except Exception as e:
+            logging.debug(f"Link validation failed for {link}: {e}")
+            return False
 
     def crawl_page(self, url: str) -> Optional[PageInfo]:
         """Crawl a single page"""
         try:
+            # Double-check domain before crawling
+            if not self._is_same_domain(url):
+                logging.debug(f"Skipping external domain in crawl_page: {url}")
+                return None
+
             response = self.client.get(url)
             page_info = self.analyze_page(url, response)
 
-            # Extract links for further crawling
-            if len(self.visited) < self.config.max_pages:
-                new_links = self.extract_links(response.text, url)
-                with self.lock:
-                    for link in new_links:
-                        if link not in self.visited and link not in self.to_visit:
-                            self.to_visit.append(link)
+            # Filter links immediately after extraction
+            filtered_links = []
+            for link in page_info.links:
+                if self._should_crawl_link(link):
+                    filtered_links.append(link)
+                else:
+                    logging.debug(f"Filtered out link: {link}")
+
+            # Replace with filtered links
+            page_info.links = filtered_links
 
             return page_info
+
         except Exception as e:
             logging.error(f"Failed to crawl {url}: {e}")
             return None
+
+    def extract_links(self, html_content: str, base_url: str) -> List[str]:
+        """Extract all links from HTML with immediate filtering"""
+        if not BS4_AVAILABLE:
+            return []
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        links = []
+
+        # Define tags and their attributes that contain URLs
+        tag_attributes = [
+            ('a', 'href'),
+            ('link', 'href'),
+            ('img', 'src'),
+            ('script', 'src'),
+            ('iframe', 'src'),
+            ('frame', 'src'),
+            ('form', 'action'),
+            ('area', 'href'),
+            ('base', 'href'),
+            ('embed', 'src'),
+            ('source', 'src'),
+            ('track', 'src'),
+            ('object', 'data')
+        ]
+
+        for tag_name, attr in tag_attributes:
+            for tag in soup.find_all(tag_name, {attr: True}):
+                url = tag[attr]
+
+                # Skip empty URLs
+                if not url or url.strip() == '':
+                    continue
+
+                # Skip anchors and JavaScript
+                if url.startswith(('#', 'javascript:', 'mailto:', 'tel:', 'data:')):
+                    continue
+
+                # Make absolute URL
+                try:
+                    absolute_url = urljoin(base_url, url)
+
+                    # Filter immediately based on domain
+                    if self.base_domain and not self._is_same_domain(absolute_url):
+                        continue
+
+                    # Add to links
+                    links.append(absolute_url)
+
+                except Exception as e:
+                    logging.debug(f"Failed to process URL {url}: {e}")
+                    continue
+
+        # Remove duplicates
+        unique_links = list(set(links))
+
+        print("Links : "+unique_links.__str__())
+
+        # Debug logging
+        if unique_links:
+            logging.debug(f"Extracted {len(unique_links)} links from {base_url}")
+            if len(unique_links) <= 5:
+                for link in unique_links:
+                    logging.debug(f"  - {link}")
+
+        return unique_links
 
     def analyze_page(self, url: str, response: requests.Response) -> PageInfo:
         """Analyze page content and extract information"""
@@ -501,7 +749,7 @@ class WebCrawler:
         # Extract scripts
         scripts = self.extract_scripts(response.text) if soup else []
 
-        # Extract links
+        # Extract links (already filtered by extract_links)
         links = self.extract_links(response.text, url)
 
         # Extract title
@@ -590,28 +838,6 @@ class WebCrawler:
                 scripts.append(f"inline:{hashlib.md5(script.string.encode()).hexdigest()[:8]}")
 
         return scripts
-
-    def extract_links(self, html_content: str, base_url: str) -> List[str]:
-        """Extract all links from HTML"""
-        if not BS4_AVAILABLE:
-            return []
-
-        soup = BeautifulSoup(html_content, 'html.parser')
-        links = []
-
-        for tag in soup.find_all(['a', 'link', 'img', 'script', 'iframe'], href=True):
-            href = tag['href']
-            if href and not href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
-                absolute_url = urljoin(base_url, href)
-                links.append(absolute_url)
-
-        for tag in soup.find_all(['img', 'script', 'iframe'], src=True):
-            src = tag['src']
-            if src:
-                absolute_url = urljoin(base_url, src)
-                links.append(absolute_url)
-
-        return list(set(links))  # Remove duplicates
 
 
 # ============================================================================
@@ -2384,7 +2610,7 @@ class AdvancedXSSScanner:
             level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(f"xss_scan_{self.results.scan_id}.log"),
+                logging.FileHandler(f"{self.results.scan_id}.log"),
                 logging.StreamHandler()
             ]
         )
@@ -2754,14 +2980,53 @@ Examples:
 
         # Generate reports
         if args.format in ["json", "both"]:
-            output_file = f"{args.output}.json" or f"xss_report_{results.scan_id}.json"
-            ReportGenerator.generate_json_report(results, output_file)
+            if args.output:
+                # User provided output name
+                if '.' in args.output:
+                    # Has extension
+                    if args.output.endswith('.json'):
+                        json_output = args.output
+                    elif args.output.endswith('.html'):
+                        json_output = args.output.replace('.html', '.json')
+                    else:
+                        # Some other extension, replace with .json
+                        json_output = os.path.splitext(args.output)[0] + '.json'
+                else:
+                    # No extension provided
+                    if args.format == "both":
+                        json_output = args.output + ".json"
+                    else:
+                        json_output = args.output if args.output.endswith('.json') else args.output + '.json'
+            else:
+                # Auto-generate
+                json_output = f"xss_report_{results.scan_id}.json"
+
+            ReportGenerator.generate_json_report(results, json_output)
 
         if args.format in ["html", "both"]:
-            output_file = f"{args.output}.html" or f"xss_report_{results.scan_id}.html"
-            if args.format == "both":
-                output_file = output_file.replace('.json', '.html')
-            ReportGenerator.generate_html_report(results, output_file)
+            if args.output:
+                # User provided output name
+                if '.' in args.output:
+                    # Has extension
+                    if args.output.endswith('.html'):
+                        html_output = args.output
+                    elif args.output.endswith('.json'):
+                        html_output = args.output.replace('.json', '.html')
+                    else:
+                        # Some other extension, replace with .html
+                        html_output = os.path.splitext(args.output)[0] + '.html'
+                else:
+                    # No extension provided
+                    if args.format == "both":
+                        html_output = args.output + ".html"
+                    else:
+                        html_output = args.output if args.output.endswith('.html') else args.output + '.html'
+            else:
+                # Auto-generate
+                html_output = f"xss_report_{results.scan_id}.html"
+
+            ReportGenerator.generate_html_report(results, html_output)
+
 
         # Print summary
         print("\n" + "=" * 80)
@@ -2832,3 +3097,8 @@ if __name__ == "__main__":
 #   --output xs_vulnerability_report \
 #   --verbose
 #========================
+
+
+
+
+# --depth 0 (only for defined URL )
