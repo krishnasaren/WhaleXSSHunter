@@ -1,7 +1,3 @@
-# WhaleXSSHunter
-Ad advance XSS hunter
-
-
 # 🚀 Advanced XSS Scanner
 
 A comprehensive, production-ready XSS vulnerability scanner that detects Reflected, Stored, DOM, and Blind XSS vulnerabilities through URL-based scanning.
